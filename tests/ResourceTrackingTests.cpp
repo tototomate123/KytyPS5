@@ -876,53 +876,67 @@ void TestSharedUniformLoopIndex() {
 }
 
 void CheckBoundedAddressImageKeys(bool branch_guard, bool guarded_result,
-                                  ResourceKind material_kind = ResourceKind::ScalarAddress) {
+                                  ResourceKind material_kind = ResourceKind::ScalarAddress,
+                                  bool invariant_mask = false) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture;
   auto *entry = fixture.block;
+  auto *outer = fixture.AddBlock();
   auto *header = fixture.AddBlock();
   auto *body = fixture.AddBlock();
   auto *exit = fixture.AddBlock();
-  entry->AddBranch(header);
+  entry->AddBranch(outer);
+  outer->AddBranch(outer);
+  outer->AddBranch(header);
   header->AddBranch(body);
   header->AddBranch(exit);
   body->AddBranch(header);
   if (!branch_guard) body->AddBranch(exit);
   fixture.program.block_info[0].terminator = {
       .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
-  fixture.program.block_info[1].terminator = branch_guard
+  fixture.program.block_info[2].terminator = branch_guard
       ? CFG::Terminator{.kind = CFG::TerminatorKind::ConditionalBranch,
-                        .true_block = 2u, .false_block = 3u}
+                        .true_block = 3u, .false_block = 4u}
       : CFG::Terminator{.kind = CFG::TerminatorKind::Branch,
-                        .true_block = 2u};
-  fixture.program.block_info[2].terminator = {
+                        .true_block = 3u};
+  fixture.program.block_info[3].terminator = {
       .kind = branch_guard ? CFG::TerminatorKind::Branch
                            : CFG::TerminatorKind::ConditionalBranch,
-      .true_block = 1u, .false_block = branch_guard ? 0u : 3u};
-  fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+      .true_block = 2u, .false_block = branch_guard ? 0u : 4u};
+  fixture.program.block_info[4].terminator.kind = CFG::TerminatorKind::Return;
 
-  const auto active = fixture.Emit(
+  fixture.program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1u, .false_block = 2u};
+  fixture.program.block_info[1].condition = Value(false);
+  auto active = fixture.Emit(
       ValueOpcode::INotEqual32, {fixture.UserData(3), Value(0u)}, 0, entry);
+  if (invariant_mask) {
+    auto &fixed = outer->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    fixed.AddPhiOperand(entry, active);
+    fixed.AddPhiOperand(outer, Value(&fixed));
+    active = Value(&fixed);
+  }
+  auto *payload = invariant_mask ? outer : entry;
   auto &loop = header->AppendNewInst(ValueOpcode::Phi, {},
                                       static_cast<uint64_t>(Type::U1));
   const auto next = fixture.Emit(ValueOpcode::LogicalAnd,
                                  {Value(&loop), active}, 0, body);
-  loop.AddPhiOperand(entry, active);
+  loop.AddPhiOperand(outer, active);
   loop.AddPhiOperand(body, next);
-  fixture.program.block_info[1].condition = Value(&loop);
-  if (!branch_guard) fixture.program.block_info[2].condition = Value(&loop);
+  fixture.program.block_info[2].condition = Value(&loop);
+  if (!branch_guard) fixture.program.block_info[3].condition = Value(&loop);
 
   const auto pointer = fixture.Address(fixture.UserData(0),
                                         fixture.UserData(1), 0x20);
   const auto clamped = fixture.Emit(ValueOpcode::UMin32,
-                                    {fixture.UserData(2), Value(7u)}, 0, entry);
+                                    {fixture.UserData(2), Value(7u)}, 0, payload);
   const auto record = fixture.Emit(ValueOpcode::ShiftRightArithmetic32,
-                                   {clamped, Value(2u)}, 0, entry);
+                                   {clamped, Value(2u)}, 0, payload);
   const auto record_offset = fixture.Emit(ValueOpcode::IAdd32,
       {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
-                    {record, Value(4u)}, 0, entry), Value(16u)}, 0, entry);
+                    {record, Value(4u)}, 0, payload), Value(16u)}, 0, payload);
   const auto offset = fixture.Emit(ValueOpcode::SelectU32,
-                                   {active, record_offset, Value(0u)}, 0, entry);
+                                   {active, record_offset, Value(0u)}, 0, payload);
   std::array<Value, 4> reads;
   for (uint32_t index = 0; index < reads.size(); ++index) {
     MemoryInfo memory;
@@ -930,29 +944,29 @@ void CheckBoundedAddressImageKeys(bool branch_guard, bool guarded_result,
     memory.offset = index * 4u;
     reads[index] = fixture.Emit(ValueOpcode::LoadAddressU32,
                                 {pointer, offset, Value(0u), active},
-                                fixture.AddMemory(memory, 0x30), entry);
+                                fixture.AddMemory(memory, 0x30), payload);
   }
   const auto selected = fixture.Emit(
       ValueOpcode::SelectU32,
       {fixture.Emit(ValueOpcode::INotEqual32,
-                    {fixture.UserData(6), Value(0u)}, 0, entry),
+                    {fixture.UserData(6), Value(0u)}, 0, payload),
        fixture.Emit(ValueOpcode::SelectU32,
                     {fixture.Emit(ValueOpcode::INotEqual32,
-                                  {fixture.UserData(4), Value(0u)}, 0, entry),
+                                  {fixture.UserData(4), Value(0u)}, 0, payload),
                      reads[0],
                      fixture.Emit(ValueOpcode::SelectU32,
                                   {fixture.Emit(ValueOpcode::INotEqual32,
-                                                {fixture.UserData(5), Value(0u)}, 0, entry),
-                                   reads[1], reads[2]}, 0, entry)}, 0, entry),
-       reads[3]}, 0, entry);
+                                                {fixture.UserData(5), Value(0u)}, 0, payload),
+                                   reads[1], reads[2]}, 0, payload)}, 0, payload),
+       reads[3]}, 0, payload);
   const auto eight = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
-                                  {selected, Value(3u)}, 0, entry);
+                                  {selected, Value(3u)}, 0, payload);
   const auto three = fixture.Emit(ValueOpcode::IAdd32,
       {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
-                    {eight, Value(1u)}, 0, entry), eight}, 0, entry);
+                    {eight, Value(1u)}, 0, payload), eight}, 0, payload);
   const auto key_value = fixture.Emit(ValueOpcode::SelectU32,
       {active, fixture.Emit(ValueOpcode::IAdd32,
-                            {Value(13u), three}, 0, entry), Value(0u)}, 0, entry);
+                            {Value(13u), three}, 0, payload), Value(0u)}, 0, payload);
   const auto key = fixture.Emit(ValueOpcode::ReadFirstLane,
                                 {key_value, Value(&loop)}, 0, body);
   const auto table_offset = fixture.Emit(ValueOpcode::IAdd32,
@@ -1050,6 +1064,7 @@ void TestBoundedAddressImageKeys() {
   CheckBoundedAddressImageKeys(true, true);
   CheckBoundedAddressImageKeys(false, true);
   CheckBoundedAddressImageKeys(false, true, ResourceKind::Global);
+  CheckBoundedAddressImageKeys(false, true, ResourceKind::Global, true);
   CheckBoundedAddressImageKeys(false, false);
 }
 

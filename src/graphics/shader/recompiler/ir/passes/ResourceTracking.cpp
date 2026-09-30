@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -351,6 +353,26 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		// Capture failures before terminating, including shaders encountered before
+		// loading diagnostics become active. Shader order varies between runs.
+		if (m_program.shader_hash != 0u && !m_decoded.code.empty()) {
+			std::error_code error;
+			const auto directory = std::filesystem::temp_directory_path(error);
+			if (!error) {
+				const auto path = directory /
+				    fmt::format("kyty-hfw-{:016x}-resource-error.txt", m_program.shader_hash);
+				std::ofstream dump(path);
+				if (dump) {
+					dump << message << "\n" << ProgramToString(m_program);
+					std::fprintf(stderr, "Shader resource diagnostic written to %s\n",
+					             path.string().c_str());
+				}
+				std::ofstream code_dump(directory /
+				    fmt::format("kyty-hfw-{:016x}-code.bin", m_program.shader_hash), std::ios::binary);
+				code_dump.write(reinterpret_cast<const char*>(m_decoded.code.data()),
+				                static_cast<std::streamsize>(m_decoded.code.size_bytes()));
+			}
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -1273,7 +1295,7 @@ private:
 
 	bool Implies(Value guard, Value required) const {
 		guard    = SimplifyGuard(guard);
-		required = required.Resolve();
+		required = SimplifyGuard(required);
 		if (EquivalentValue(m_program, guard, required)) return true;
 		const auto* inst = guard.TryInstruction();
 		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
@@ -1284,14 +1306,14 @@ private:
 	                      uint32_t depth = 0) const {
 		if (depth > 32u) return false;
 		guard    = SimplifyGuard(guard);
-		required = required.Resolve();
+		required = SimplifyGuard(required);
 		if (EquivalentValue(m_program, guard, required)) return true;
 		const auto* inst = guard.TryInstruction();
 		if (inst == nullptr) return false;
 		if (std::ranges::find(active, inst) != active.end()) {
 			if (inst->GetOpcode() != ValueOpcode::Phi) return false;
 			for (size_t index = 0; index < inst->NumArgs(); index++) {
-				if (EquivalentValue(m_program, inst->Arg(index), required)) return true;
+				if (EquivalentValue(m_program, SimplifyGuard(inst->Arg(index)), required)) return true;
 			}
 			return false;
 		}

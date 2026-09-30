@@ -1627,8 +1627,11 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
   }
 }
 
-void TestStridedHighBitsImageTable(uint32_t clamp = 0u, bool descriptor_dimensions = false) {
+void TestStridedHighBitsImageTable(uint32_t clamp = 0u, bool descriptor_dimensions = false,
+                                 uint32_t shift_stride = 0u) {
   Fixture fixture;
+  const uint32_t stride = shift_stride ? 1u << shift_stride : 68u;
+  const uint32_t member_offset = shift_stride ? 32u : 4u;
   const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
   auto key = fixture.Emit(ValueOpcode::ShiftRightLogical32,
       {clamp ? fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)})
@@ -1639,10 +1642,10 @@ void TestStridedHighBitsImageTable(uint32_t clamp = 0u, bool descriptor_dimensio
         clamp == 1u ? std::initializer_list<Value>{key, limit}
                     : std::initializer_list<Value>{limit, key});
   }
-  const auto record = fixture.Emit(ValueOpcode::IMul32,
-                                    {key, Value(68u)});
+  const auto record = fixture.Emit(shift_stride ? ValueOpcode::ShiftLeftLogical32 : ValueOpcode::IMul32,
+                                    {key, Value(shift_stride ? shift_stride : stride)});
   const auto table_offset = fixture.Emit(ValueOpcode::IAdd32,
-      {record, Value(4u)});
+      {record, Value(member_offset)});
   std::array<Value, 8> image_words;
   for (uint32_t dword = 0; dword < image_words.size(); ++dword) {
     MemoryInfo read;
@@ -1687,13 +1690,24 @@ void TestStridedHighBitsImageTable(uint32_t clamp = 0u, bool descriptor_dimensio
   }
   const auto &indirect = fixture.program.descriptor_sources[
       fixture.program.info.images.at(0).source].indirect_image;
-  Check(indirect && indirect->table_stride == 68u &&
-            indirect->table_offset == 4u &&
+  Check(indirect && indirect->table_stride == stride &&
+            indirect->table_offset == member_offset &&
             (clamp ? !indirect->key_count.IsImmediate()
                    : indirect->key_count.IsImmediate() && indirect->key_count.U32() == 64u),
         "bounded strided image table was not recognized");
 
   LinearTestMemory memory;
+  if (shift_stride == 31u) {
+    std::array<uint32_t, 8> user_data{0x1000u, 0u, 0u, 0x3000u, 4u << 16u, 1u, 0u, 1u};
+    const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                             .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(!MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                                snapshot, specialization) && memory.reads == 0u,
+          "shifted image table with a wrapping byte extent was probed");
+    return;
+  }
   std::array<uint32_t, 8> descriptor{};
   descriptor[0] = 0x20u;
   descriptor[1] = static_cast<uint32_t>(
@@ -1702,8 +1716,8 @@ void TestStridedHighBitsImageTable(uint32_t clamp = 0u, bool descriptor_dimensio
   descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
       (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   std::copy(descriptor.begin(), descriptor.end(),
-            memory.words.begin() + (68u + 4u) / 4u);
-  if (clamp) memory.fail_address = memory.base + 2u * 68u + 4u;
+            memory.words.begin() + (stride + member_offset) / 4u);
+  if (clamp) memory.fail_address = memory.base + 2u * stride + member_offset;
   std::array<uint32_t, 8> user_data{0x1000u, 0u, 0u,
                                     0x3000u, 4u << 16u, 1u, 0u, 1u};
   const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
@@ -4519,6 +4533,10 @@ int main() {
     Run("strided high-bits image table", [] { TestStridedHighBitsImageTable(); });
     Run("image descriptor dimension reads", [] { TestStridedHighBitsImageTable(0u, true); });
     Run("clamped high-bits image table", [] { TestStridedHighBitsImageTable(1u); });
+    Run("shifted image record table", [] {
+      TestStridedHighBitsImageTable(0u, false, 6u);
+      TestStridedHighBitsImageTable(0u, false, 31u);
+    });
     Run("reversed clamped image table", [] { TestStridedHighBitsImageTable(2u); });
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("expanded image tables", [] { TestExpandedImageTables(); });

@@ -1200,9 +1200,9 @@ private:
 			}
 			uint32_t immediate;
 			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
-			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
+			    ImmediateU32(inst->Arg(1), immediate) && immediate >= 5u && immediate < 32u) {
 				key = inst->Arg(0).Resolve();
-				stride = 32u;
+				stride = 1u << immediate;
 				return key.GetType() == Type::U32;
 			}
 			if (inst->GetOpcode() == ValueOpcode::IMul32) {

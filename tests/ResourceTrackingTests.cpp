@@ -1362,7 +1362,7 @@ void TestIndirectFormattedBuffer(uint32_t components) {
         "dynamic formatted XY(ZW) buffer was not routed through GPU address mapping");
 }
 
-void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false) {
+void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, bool clamped = false) {
   Fixture fixture;
   const auto material = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
                                         fixture.UserData(2), fixture.UserData(3)});
@@ -1382,8 +1382,10 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false) {
     selector_word = fixture.Emit(ValueOpcode::ReadConstBuffer,
         {records, offset}, fixture.AddMemory(record_read, 0x0c));
   }
-  const auto selector = fixture.Emit(ValueOpcode::ShiftRightLogical32,
+  auto selector = fixture.Emit(ValueOpcode::ShiftRightLogical32,
                                       {selector_word, Value(26u)});
+  if (clamped) selector = fixture.Emit(ValueOpcode::UMin32,
+                                      {fixture.UserData(15), selector});
   const auto byte_offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
                                          {selector, Value(2u)});
   MemoryInfo scalar;
@@ -1432,6 +1434,8 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false) {
   Check(indirect && indirect->address_key && indirect->address_key_count == 64u &&
             indirect->key_mask == 0xffffu && indirect->key_scale == 24u,
         "masked scalar buffer image keys were not recognized");
+  Check(!clamped || !indirect->selector_count.IsEmpty(),
+        "runtime scalar buffer selector clamp was not tracked");
   Check(!nested || (indirect->selector_record_source != UINT32_MAX &&
                      indirect->selector_record_count == 4u &&
                      indirect->selector_record_stride == 16u &&
@@ -1460,20 +1464,32 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false) {
     std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + offset);
     memory.words[offset] += n;
   }
-  std::array<uint32_t, 15> user_data{0x1000u, 4u << 16u, 64u, 0u,
+  std::array<uint32_t, 16> user_data{0x1000u, 4u << 16u, 64u, 0u,
                                      0x2000u, 0u, 0u,
                                      0x3000u, 4u << 16u, 1u, 0u,
-                                     0x1100u, 16u << 16u, 4u, 0u};
+                                     0x1100u, 16u << 16u, 4u, 0u, 1u};
+  if (clamped) memory.fail_address = memory.base + 8u;
   const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
                            .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
                              snapshot, specialization) &&
-            snapshot.images.size() == (nested ? 2u : 3u) &&
+            snapshot.images.size() == (nested || clamped ? 2u : 3u) &&
             snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] ==
-                (nested ? 2u : 3u),
+                (nested || clamped ? 2u : 3u),
         "masked scalar buffer image keys were not materialized");
+  if (clamped) {
+    memory.fail_address = UINT64_MAX;
+    user_data[15] = UINT32_MAX;
+    Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                               snapshot, specialization) && snapshot.images.size() == 3u,
+          "maximum runtime selector limit overflowed the bounded count");
+    user_data[15] = 0u;
+    Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                               snapshot, specialization) && snapshot.images.size() == 1u,
+          "zero selector limit omitted the reachable zero entry");
+  }
   if (nested) {
     user_data[13] = 3u;
     Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
@@ -4363,6 +4379,7 @@ int main() {
     Run("indirect formatted XYZ buffer", [] { TestIndirectFormattedBuffer(3u); });
     Run("indirect formatted XYZW buffer", [] { TestIndirectFormattedBuffer(4u); });
     Run("masked scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(); });
+    Run("clamped scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(false, false, true); });
     Run("nested scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(true); });
     Run("mixed numeric indirect gather", [] { TestMaskedScalarBufferImageKeys(true, true); });
     Run("strided high-bits image table", [] { TestStridedHighBitsImageTable(); });

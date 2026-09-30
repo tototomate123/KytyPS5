@@ -308,7 +308,14 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 			material_base = material.Base48();
 			material_size = material.GetSize();
 		}
-		std::vector<uint32_t> words(indirect.address_key_count);
+		uint32_t selector_count = indirect.address_key_count;
+		if (!indirect.selector_count.IsEmpty()) {
+			uint32_t runtime_count = 0;
+			if (!clean.Evaluate(indirect.selector_count, runtime_count) || runtime_count == 0u)
+				return false;
+			selector_count = std::min(selector_count, runtime_count);
+		}
+		std::vector<uint32_t> words(selector_count);
 		if (!ReadScalarTable(material_base, material_size, indirect.selector_offset, runtime, words))
 			return false;
 		keys.reserve(words.size());

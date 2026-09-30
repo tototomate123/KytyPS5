@@ -1580,7 +1580,23 @@ private:
 		    byte_offset->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
 		    byte_offset->NumArgs() != 2u ||
 		    !ImmediateU32(byte_offset->Arg(1), shift) || shift != 2u) return false;
-		const auto* selector = byte_offset->Arg(0).Resolve().TryInstruction();
+		const auto selector_value = byte_offset->Arg(0).Resolve();
+		const auto* selector = selector_value.TryInstruction();
+		bool clamped = false;
+		if (selector != nullptr && selector->GetOpcode() == ValueOpcode::UMin32 &&
+		    selector->NumArgs() == 2u) {
+			for (uint32_t side = 0; side < 2u; ++side) {
+				const auto* candidate = selector->Arg(side).Resolve().TryInstruction();
+				uint32_t candidate_shift = 0;
+				if (candidate != nullptr && candidate->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
+				    ImmediateU32(candidate->Arg(1), candidate_shift) &&
+				    candidate_shift >= 24u && candidate_shift <= 31u) {
+					selector = candidate;
+					clamped = true;
+					break;
+				}
+			}
+		}
 		if (selector == nullptr ||
 		    selector->GetOpcode() != ValueOpcode::ShiftRightLogical32 ||
 		    selector->NumArgs() != 2u ||
@@ -1595,6 +1611,10 @@ private:
 		indirect.address_key       = true;
 		indirect.key_mask          = bits;
 		indirect.key_scale         = scale;
+		if (clamped) {
+			const auto count = BoundedHighBitsImageCount(selector_value);
+			if (!count.IsEmpty() && !count.IsImmediate()) indirect.selector_count = count;
+		}
 		// A selector loaded from a bounded record table need only visit values
 		// present in those records, rather than every value of its high bits.
 		const auto selector_shift = shift;
@@ -1603,7 +1623,7 @@ private:
 		const auto* record_memory = record_read != nullptr
 		                               ? ScalarReadMemory(*record_read, record_memory_index)
 		                               : nullptr;
-		if (record_memory != nullptr && record_memory->kind == ResourceKind::ScalarBuffer) {
+		if (!clamped && record_memory != nullptr && record_memory->kind == ResourceKind::ScalarBuffer) {
 			const auto* record_offset = record_read->Arg(1).Resolve().TryInstruction();
 			uint32_t record_shift = 0;
 			if (record_offset != nullptr &&

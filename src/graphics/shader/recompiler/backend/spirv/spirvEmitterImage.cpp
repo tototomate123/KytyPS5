@@ -477,6 +477,67 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	return result;
 }
 
+uint32_t EmitThreeDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                      uint32_t coord, Prospero::TextureNumericClass numeric_class) {
+	auto& state = ctx.state;
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto image = LoadSampledImageDescriptor(state, mem.resource);
+	const auto size  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 3), size, image,
+	                          ConstantU32(state, 0));
+	uint32_t extent[3] {};
+	uint32_t origin[3] {};
+	for (uint32_t axis = 0; axis < 3u; ++axis) {
+		const auto size_axis = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), size_axis, size, axis);
+		extent[axis] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), extent[axis], size_axis);
+		const auto coord_axis = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), coord_axis, coord, axis);
+		auto texel = Binary(state, spv::OpFMul, TypeF32(state), coord_axis, extent[axis]);
+		// Gather the XY bilinear footprint in the nearest Z slice. Sampling
+		// texel centers preserves the sampler's wrapping and border behavior.
+		if (axis < 2u)
+			texel =
+			    Binary(state, spv::OpFSub, TypeF32(state), texel, ConstantF32(state, 0x3f000000u));
+		origin[axis] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), origin[axis], GlslStd450(state),
+		                          GLSLstd450Floor, texel);
+	}
+	const auto sampled     = MakeSampledImage(state, mem.resource, mem.sampler);
+	const auto vector_type = ImageVectorType(state, numeric_class, 4);
+	const auto scalar_type = ImageScalarType(state, numeric_class);
+	const auto component =
+	    ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
+	        ? ImageGatherComponent(mem.dmask)
+	        : 0u;
+	constexpr uint32_t offsets[4][2] {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+	uint32_t           values[4] {};
+	for (uint32_t index = 0; index < 4u; ++index) {
+		uint32_t position[3] {};
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			const bool upper = axis < 2u && offsets[index][axis] != 0u;
+			position[axis]   = Binary(state, spv::OpFDiv, TypeF32(state),
+			                          Binary(state, spv::OpFAdd, TypeF32(state), origin[axis],
+			                                 ConstantF32(state, upper ? 0x3fc00000u : 0x3f000000u)),
+			                          extent[axis]);
+		}
+		const auto sample_coord = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), sample_coord,
+		                          position[0], position[1], position[2]);
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpImageSampleExplicitLod, vector_type, texel, sampled,
+		                          sample_coord, spv::ImageOperandsLodMask, ZeroF32(state));
+		values[index] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, scalar_type, values[index], texel,
+		                          component);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, result, values[0], values[1],
+	                          values[2], values[3]);
+	return result;
+}
+
 uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
@@ -811,6 +872,18 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				if (dimension == ImageDimension::Dim1DArray) {
 					ctx.Fail(inst, "has an unsupported 1D-array gather");
 					return uint32_t {0};
+				}
+				if (dimension == ImageDimension::Dim3D) {
+					if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
+					    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
+					    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+						ctx.Fail(inst, "has an unsupported 3D gather variant");
+						return uint32_t {0};
+					}
+					const auto sample =
+					    EmitThreeDimensionalGatherLz(ctx, candidate_memory, coord, numeric_class);
+					return ResultVector(ctx, UnpackImageGather(ctx, candidate_memory, sample),
+					                    numeric_class, false, candidate_memory, true);
 				}
 				const auto sampled = MakeSampledImage(state, resource, candidate_memory.sampler);
 				const auto sample  = state.builder.AllocateId();

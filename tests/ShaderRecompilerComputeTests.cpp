@@ -1175,6 +1175,7 @@ struct TestCase {
   vk::ImageType sampled_image_type = vk::ImageType::e2D;
   vk::ImageViewType sampled_image_view_type = vk::ImageViewType::e2D;
   u32 sampled_image_layers = 1;
+  u32 sampled_image_depth = 1;
   u32 sampled_image_view_base_layer = 0;
   u32 sampled_image_view_layers = 0;
   std::vector<u32> storage_image_rgba;
@@ -1818,6 +1819,7 @@ public:
     u32 width = 0;
     u32 height = 0;
     u32 layers = 1;
+    u32 depth = 1;
     u32 mip_levels = 1;
     u32 dwords_per_pixel = 0;
   };
@@ -13526,10 +13528,10 @@ public:
   }
 
   static size_t ImageMipDwordCount(u32 width, u32 height, u32 dwords_per_pixel,
-                                   u32 level, u32 layers = 1) {
+                                   u32 level, u32 layers = 1, u32 depth = 1) {
     return static_cast<size_t>(MipExtent(width, level)) *
            static_cast<size_t>(MipExtent(height, level)) * layers *
-           dwords_per_pixel;
+           dwords_per_pixel * MipExtent(depth, level);
   }
 
   Image CreateImageMips(const char *shader_name, u32 width, u32 height,
@@ -13539,12 +13541,14 @@ public:
                         vk::ImageType image_type, vk::ImageViewType view_type,
                         u32 layers, u32 view_base_layer = 0,
                         u32 view_layers = 0,
-                        vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
+                        vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
+                        u32 depth = 1) {
     Image ret;
     ret.format = format;
     ret.width = width;
     ret.height = height;
     ret.layers = layers;
+    ret.depth = depth;
     ret.mip_levels = std::max<u32>(static_cast<u32>(initial_mips.size()), 1u);
     ret.dwords_per_pixel = dwords_per_pixel;
 
@@ -13554,7 +13558,7 @@ public:
     image_info.format = format;
     image_info.extent.width = width;
     image_info.extent.height = height;
-    image_info.extent.depth = 1;
+    image_info.extent.depth = depth;
     image_info.mipLevels = ret.mip_levels;
     image_info.arrayLayers = layers;
     image_info.samples = samples;
@@ -13614,13 +13618,13 @@ public:
       size_t total_dwords = 0;
       for (u32 level = 0; level < ret.mip_levels; level++) {
         total_dwords +=
-            ImageMipDwordCount(width, height, dwords_per_pixel, level, layers);
+            ImageMipDwordCount(width, height, dwords_per_pixel, level, layers, depth);
       }
       std::vector<u32> contents(total_dwords, 0);
       size_t offset = 0;
       for (u32 level = 0; level < ret.mip_levels; level++) {
         const auto level_dwords =
-            ImageMipDwordCount(width, height, dwords_per_pixel, level, layers);
+            ImageMipDwordCount(width, height, dwords_per_pixel, level, layers, depth);
         const auto &src = initial_mips[level];
         for (size_t i = 0; i < src.size() && i < level_dwords; i++) {
           contents[offset + i] = src[i];
@@ -13662,7 +13666,7 @@ public:
   std::vector<u32> ReadImage(const char *shader_name, Image *image) {
     const auto dword_count = static_cast<size_t>(image->width) *
                              static_cast<size_t>(image->height) *
-                             image->layers * image->dwords_per_pixel;
+                             image->layers * image->depth * image->dwords_per_pixel;
     auto staging = CreateHostBuffer(shader_name, dword_count * sizeof(u32),
                                    vk::BufferUsageFlagBits::eTransferDst, {});
 
@@ -13681,7 +13685,7 @@ public:
     copy.imageSubresource.layerCount = image->layers;
     copy.imageExtent.width = image->width;
     copy.imageExtent.height = image->height;
-    copy.imageExtent.depth = 1;
+    copy.imageExtent.depth = image->depth;
     cmd.copyImageToBuffer(image->image, vk::ImageLayout::eTransferSrcOptimal,
                           staging.buffer, 1, &copy);
     EndSubmitAndFree(shader_name, "readback", cmd);
@@ -13763,7 +13767,9 @@ public:
                     image.dimension ==
                         ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
                     image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
+                    (image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
+                     test.sampled_image_view_type == vk::ImageViewType::e3D);
       }
       Require(test.name, "dispatch", supported,
               "unsupported image dimension needs a matching Vulkan test view");
@@ -16790,11 +16796,11 @@ private:
       copy.imageSubresource.layerCount = image->layers;
       copy.imageExtent.width = MipExtent(image->width, level);
       copy.imageExtent.height = MipExtent(image->height, level);
-      copy.imageExtent.depth = 1;
+      copy.imageExtent.depth = MipExtent(image->depth, level);
       copies.push_back(copy);
       offset += static_cast<vk::DeviceSize>(
           ImageMipDwordCount(image->width, image->height,
-                             image->dwords_per_pixel, level, image->layers) *
+                             image->dwords_per_pixel, level, image->layers, image->depth) *
           sizeof(u32));
     }
     cmd.copyBufferToImage(staging, image->image,
@@ -17043,7 +17049,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         sampled_dwords_per_pixel, vk::ImageLayout::eShaderReadOnlyOptimal,
         test.sampled_image_type, test.sampled_image_view_type,
         test.sampled_image_layers, test.sampled_image_view_base_layer,
-        test.sampled_image_view_layers);
+        test.sampled_image_view_layers, vk::SampleCountFlagBits::e1,
+        test.sampled_image_depth);
   }
   if (needs_storage_image) {
     storage_image = vulkan->CreateImage2D(
@@ -28622,6 +28629,56 @@ TestCase ImageGather2DInstructionWith1DDescriptor() {
   return test;
 }
 
+TestCase ImageGather3DLevelZero(bool integer) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = integer ? "ImageGather3DUintLevelZero" : "ImageGather3DFloatLevelZero";
+  test.image_width = test.image_height = 4;
+  test.sampled_image_depth = 2;
+  test.sampled_image_type = vk::ImageType::e3D;
+  test.sampled_image_view_type = vk::ImageViewType::e3D;
+  test.sampled_image_format = integer ? vk::Format::eR32G32B32A32Uint
+                                    : vk::Format::eR32G32B32A32Sfloat;
+  const auto bits = [integer](u32 value) {
+    return integer ? value : std::bit_cast<u32>(static_cast<float>(value));
+  };
+  test.sampled_image_rgba.resize(4u * 4u * 2u * 4u);
+  for (u32 z = 0; z < 2u; ++z)
+    for (u32 y = 0; y < 4u; ++y)
+      for (u32 x = 0; x < 4u; ++x)
+        for (u32 channel = 0; channel < 4u; ++channel)
+          test.sampled_image_rgba[((z * 4u + y) * 4u + x) * 4u + channel] =
+              bits(100u * z + 10u * y + x + 1000u * channel);
+  for (u32 sample = 0; sample < 3u; ++sample) {
+    const bool edge = sample == 2u;
+    AppendVMovLiteral(&test.code, 20, edge ? 0u : 0x3f000000u);
+    AppendVMovLiteral(&test.code, 21, edge ? 0u : 0x3f000000u);
+    AppendVMovLiteral(&test.code, 22, sample == 0u ? 0x3e800000u : 0x3f400000u);
+    test.code.push_back(EncodeMimg0(0x47, 0x2, 0, false, 2));
+    test.code.push_back(EncodeMimg1(0, 20));
+    for (u32 i = 0; i < 4u; ++i) AppendStoreVgpr(&test.code, i, sample * 4u + i);
+    const u32 z = sample == 0u ? 0u : 1u;
+    if (edge) {
+      test.expected.insert(test.expected.end(), 4u, bits(100u * z + 1000u));
+    } else {
+      for (const auto value : {21u, 22u, 12u, 11u})
+        test.expected.push_back(bits(100u * z + 1000u + value));
+    }
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_LZ, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeSampledTextureData(integer ? Prospero::BufferFormat::k32_32_32_32UInt
+                                                : Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[3] = (test.user_data[3] & 0x0fffffffu) |
+                     (static_cast<u32>(Prospero::ImageType::kColor3D) << 28u);
+  test.user_data[4] = 1u;
+  test.has_user_data = true;
+  test.expected_force_point_sampler = integer;
+  test.required_spirv = {"OpImageQuerySizeLod", "OpImageSampleExplicitLod", "Floor"};
+  test.forbidden_spirv = {"OpImageGather"};
+  return test;
+}
+
 TestCase ImageLoad1DArrayUsesLayerCoordinate() {
   using O = ShaderOpcode;
 
@@ -30940,6 +30997,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
+  AddCase([] { return ImageGather3DLevelZero(false); });
+  AddCase([] { return ImageGather3DLevelZero(true); });
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
   AddCase(ImageLoad1DArrayDescriptorUsesSelectedLayer);
   AddCase(ImageLoadMipUsesVaddr2Lod2D);
@@ -35771,6 +35830,12 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--gather-3d-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageGather3DLevelZero(false));
+    RunCase(&vulkan, ImageGather3DLevelZero(true));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());

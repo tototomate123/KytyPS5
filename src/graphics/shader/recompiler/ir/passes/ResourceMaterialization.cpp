@@ -112,7 +112,9 @@ enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
 template <typename Image>
 SamplerClass ClassifySampler(const Image& image) {
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
-	    image.conversion_format != Prospero::BufferFormat::kInvalid) {
+	    image.conversion_format != Prospero::BufferFormat::kInvalid ||
+	    (image.numeric_class == Prospero::TextureNumericClass::Uint &&
+	     image.dimension == Decoder::ImageDimension::Dim3D)) {
 		return SamplerClass::PointInteger;
 	}
 	return image.numeric_class == Prospero::TextureNumericClass::Uint ? SamplerClass::Integer

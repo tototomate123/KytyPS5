@@ -832,6 +832,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		};
 		const auto is_2d_or_3d = [](Decoder::ImageDimension dimension) {
 			return dimension == Decoder::ImageDimension::Dim2D ||
+			       dimension == Decoder::ImageDimension::Dim2DArray ||
 			       dimension == Decoder::ImageDimension::Dim3D;
 		};
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
@@ -853,7 +854,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                          !program.info.images[root_index].depth_compare;
 			if ((!gather_types && image.numeric_class != image_class.numeric_class) ||
 			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
-			     !(allow_2d_3d && is_2d_or_3d(image.dimension) &&
+			     !(allow_2d_3d && !image.cube && !image_class.cube && is_2d_or_3d(image.dimension) &&
 			       is_2d_or_3d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||

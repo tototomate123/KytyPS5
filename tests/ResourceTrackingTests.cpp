@@ -729,6 +729,40 @@ void TestInvariantIndirectImageMaterialization() {
             mixed_specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
             mixed_specialization.images[1].dimension == Decoder::ImageDimension::Dim3D,
         "3D sample rejected a table containing both 2D and 3D candidates");
+  auto array_fixture = MakeIndirectImageFixture(false);
+  for (auto &image_memory : array_fixture->program.memory_info) {
+    if (image_memory.kind == ResourceKind::Image) {
+      image_memory.image_dimension = Decoder::ImageDimension::Dim2DArray;
+      image_memory.image_address_components = 3u;
+      image_memory.image_sample_flags = Decoder::ImageSampleFlagLevelZero;
+    }
+  }
+  array_fixture->PlanAndTrack();
+  auto array_plan = ExtractResourcePlan(array_fixture->program);
+  const auto first_image = (0x2000u - memory.base) / 4u;
+  memory.words[first_image + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2DArray) << 28u);
+  memory.words[first_image + 4u] = 7u;
+  Check(MaterializeResources(array_plan, runtime, mixed_snapshot,
+                             mixed_specialization) &&
+            mixed_specialization.images[0].dimension == Decoder::ImageDimension::Dim2DArray &&
+            mixed_specialization.images[1].dimension == Decoder::ImageDimension::Dim3D,
+        "array sampling rejected a mixed array/volume texture table");
+  array_plan.info.images[0].simple_2d_3d_sampling = false;
+  Check(!MaterializeResources(array_plan, runtime, mixed_snapshot,
+                              mixed_specialization),
+        "non-simple array sampling accepted a volume candidate");
+  array_plan.info.images[0].simple_2d_3d_sampling = true;
+  memory.words[first_image + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube) << 28u);
+  memory.words[first_image + 4u] = 11u;
+  Check(!MaterializeResources(array_plan, runtime, mixed_snapshot,
+                              mixed_specialization),
+        "mixed cube/volume sampling was accepted without a coordinate proof");
+  memory.words[first_image + 3u] = image_descriptor[3];
+  memory.words[first_image + 4u] = image_descriptor[4];
   resource_plan.info.images[0].simple_2d_3d_sampling = false;
   Check(!MaterializeResources(resource_plan, runtime, mixed_snapshot,
                               mixed_specialization),

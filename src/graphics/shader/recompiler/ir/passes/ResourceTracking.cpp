@@ -2437,6 +2437,7 @@ private:
 		image.simple_2d_3d_sampling &=
 		    op == ValueOpcode::ImageSampleRaw &&
 		    (memory.image_dimension == Decoder::ImageDimension::Dim2D ||
+		     memory.image_dimension == Decoder::ImageDimension::Dim2DArray ||
 		     memory.image_dimension == Decoder::ImageDimension::Dim3D) &&
 		    (memory.image_sample_flags &
 		     (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagOffset |

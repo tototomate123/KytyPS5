@@ -29444,11 +29444,13 @@ void CheckIndirectImageKeySwitch() {
             "mixed candidate switch did not retain every image");
   }
 
-  for (const bool source_3d : {false, true}) {
+  for (const auto source_dimension : {
+           ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+           ShaderRecompiler::Decoder::ImageDimension::Dim3D,
+           ShaderRecompiler::Decoder::ImageDimension::Dim2DArray}) {
+    const bool source_3d = source_dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2D;
     for (const bool reverse_candidates : {false, true}) {
-      program.memory_info[0].image_dimension =
-          source_3d ? ShaderRecompiler::Decoder::ImageDimension::Dim3D
-                    : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      program.memory_info[0].image_dimension = source_dimension;
       program.memory_info[0].image_address_components = source_3d ? 4u : 3u;
       address.SetArg(0u, Value(std::bit_cast<u32>(1.375f)));
       address.SetArg(1u, Value(std::bit_cast<u32>(1.625f)));
@@ -29456,7 +29458,8 @@ void CheckIndirectImageKeySwitch() {
       address.SetArg(3u, Value(std::bit_cast<u32>(2.0f)));
       program.info.images = {root, candidate};
       program.info.images[0].dimension =
-          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          source_dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+              ? source_dimension : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       program.info.images[1].dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim3D;
       if (reverse_candidates) {
@@ -29482,8 +29485,8 @@ void CheckIndirectImageKeySwitch() {
         } else if (opcode == spv::OpImageSampleExplicitLod) {
           const auto coord = definitions[words[4]];
           const auto lod = definitions[words[6]];
-          const bool is_3d = program.info.images[samples].dimension ==
-              ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+          const bool is_3d = program.info.images[samples].dimension !=
+              ShaderRecompiler::Decoder::ImageDimension::Dim2D;
           const auto z = coord.size() == 6u ? definitions[coord[5]] : std::span<const u32>{};
           const auto z_value = z.size() == 4u && (z[0] & 0xffffu) == spv::OpBitcast
               ? definitions[z[3]] : z;

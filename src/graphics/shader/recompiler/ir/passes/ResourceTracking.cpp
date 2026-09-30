@@ -1559,16 +1559,19 @@ private:
 	bool MatchMaskedConstBufferKey(Value key, DescriptorSource& material_source,
 	                               DescriptorSource::IndirectImage& indirect) {
 		const auto* multiply = key.Resolve().TryInstruction();
-		if (multiply == nullptr || multiply->GetOpcode() != ValueOpcode::IMul32 ||
-		    multiply->NumArgs() != 2u) return false;
-		uint32_t scale = 0;
-		Value masked;
-		if (ImmediateU32(multiply->Arg(0), scale)) {
-			masked = multiply->Arg(1);
-		} else if (ImmediateU32(multiply->Arg(1), scale)) {
-			masked = multiply->Arg(0);
-		} else {
-			return false;
+		uint32_t scale = 1u;
+		Value masked = key;
+		// A larger descriptor stride can carry the scale in the table address
+		// itself, leaving the material key as an unscaled masked DWORD.
+		if (multiply != nullptr && multiply->GetOpcode() == ValueOpcode::IMul32 &&
+		    multiply->NumArgs() == 2u) {
+			if (ImmediateU32(multiply->Arg(0), scale)) {
+				masked = multiply->Arg(1);
+			} else if (ImmediateU32(multiply->Arg(1), scale)) {
+				masked = multiply->Arg(0);
+			} else {
+				return false;
+			}
 		}
 		if (scale == 0u) return false;
 		const auto* mask = masked.Resolve().TryInstruction();

@@ -1446,7 +1446,7 @@ void TestIndirectFormattedBuffer(uint32_t components) {
 }
 
 void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, bool clamped = false,
-                                    uint32_t image_write = 0u) {
+                                    uint32_t image_write = 0u, bool strided_table = false) {
   Fixture fixture;
   const auto material = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
                                         fixture.UserData(2), fixture.UserData(3)});
@@ -1478,10 +1478,11 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
                                   {material, byte_offset}, fixture.AddMemory(scalar, 0x10));
   const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
                                     {word, Value(0xffffu)});
-  const auto key = fixture.Emit(ValueOpcode::IMul32,
-                                 {masked, Value(24u)});
+  const auto key = strided_table ? masked : fixture.Emit(ValueOpcode::IMul32,
+                                                         {masked, Value(24u)});
   const auto table_offset = fixture.Emit(ValueOpcode::IAdd32,
-      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
+      {strided_table ? fixture.Emit(ValueOpcode::IMul32, {key, Value(768u)}) :
+                      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
        Value(0x100u)});
   std::array<Value, 8> image_words;
   for (uint32_t dword = 0; dword < image_words.size(); ++dword) {
@@ -1540,7 +1541,8 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
   const auto &indirect = fixture.program.descriptor_sources[
       fixture.program.info.images.at(0).source].indirect_image;
   Check(indirect && indirect->address_key && indirect->address_key_count == 64u &&
-            indirect->key_mask == 0xffffu && indirect->key_scale == 24u,
+            indirect->key_mask == 0xffffu && indirect->key_scale == (strided_table ? 1u : 24u) &&
+            indirect->table_stride == (strided_table ? 768u : 32u),
         "masked scalar buffer image keys were not recognized");
   Check(!clamped || !indirect->selector_count.IsEmpty(),
         "runtime scalar buffer selector clamp was not tracked");
@@ -4504,6 +4506,9 @@ int main() {
     Run("indirect formatted XYZ buffer", [] { TestIndirectFormattedBuffer(3u); });
     Run("indirect formatted XYZW buffer", [] { TestIndirectFormattedBuffer(4u); });
     Run("masked scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(); });
+    Run("strided masked scalar buffer image keys", [] {
+      TestMaskedScalarBufferImageKeys(false, false, false, 0u, true);
+    });
     Run("clamped scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(false, false, true); });
     Run("specialization with image writes", [] {
       for (uint32_t image_write = 1u; image_write <= 5u; ++image_write)

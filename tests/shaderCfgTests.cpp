@@ -5290,6 +5290,10 @@ void TestNewShaderRecompilerImageSampleOpcodeAliases() {
       EncodeMimg1(16, 0, 0, 4), // image_sample_c_a
       EncodeMimg0(0xad, 0x1),
       EncodeMimg1(20, 0, 0, 4), // image_sample_c_b_a
+      EncodeMimg0(0xd8, 0x1),
+      EncodeMimg1(24, 0, 0, 4), // image_gather4_c_o_a
+      EncodeMimg0(0xc8, 0x1),
+      EncodeMimg1(28, 0, 0, 4), // image_gather4_c_a
       0xbf810000u,
   };
 
@@ -5317,7 +5321,35 @@ void TestNewShaderRecompilerImageSampleOpcodeAliases() {
   Check(!SpirvContainsExtInst(result.spirv, 62),
         "opcode aliases without bit 62 must not unpack sampled f16 address "
         "halves");
+  Check(result.decoded_dump.find("sample_flags=compare|offset|adjust") != std::string::npos,
+        "adjusted compare gather did not preserve its flags");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 97u) == 2u,
+        "adjusted compare gathers did not emit two dref gathers");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t observed[] = {0xf160010bu, 0x0082140au, 0x003e3f39u, 0xbf810000u};
+  Libs::Graphics::ShaderRecompiler::Decoder::Program decoded;
+  Libs::Graphics::ShaderRecompiler::Decoder::DecodeProgram(observed, decoded);
+  const auto &gather = decoded.instructions.at(0);
+  using namespace Libs::Graphics::ShaderRecompiler::Decoder;
+  Check(gather.opcode == Opcode::IMAGE_GATHER4_C_O && gather.word_count == 3u &&
+            gather.data_dwords == 4u && gather.image_address_components == 4u &&
+            gather.image_sample_flags ==
+                (ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust) &&
+            gather.image_nsa_addr[0] == 57u && gather.image_nsa_addr[1] == 63u &&
+            gather.image_nsa_addr[2] == 62u,
+        "observed HFW adjusted compare gather operands decoded incorrectly");
+  const uint32_t observed_no_offset[] = {
+      0xf120010bu, 0x00821c39u, 0x00003e3fu, 0xbf810000u};
+  DecodeProgram(observed_no_offset, decoded);
+  const auto &plain_gather = decoded.instructions.at(0);
+  Check(plain_gather.opcode == Opcode::IMAGE_GATHER4_C &&
+            plain_gather.word_count == 3u && plain_gather.data_dwords == 4u &&
+            plain_gather.image_address_components == 3u &&
+            plain_gather.image_sample_flags == (ImageSampleFlagCompare | ImageSampleFlagAdjust) &&
+            plain_gather.src0.reg == 57u && plain_gather.image_nsa_addr[0] == 63u &&
+            plain_gather.image_nsa_addr[1] == 62u,
+        "observed HFW adjusted compare gather without offset decoded incorrectly");
 }
 
 void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {

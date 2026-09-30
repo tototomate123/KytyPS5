@@ -1053,7 +1053,7 @@ void TestBoundedAddressImageKeys() {
   CheckBoundedAddressImageKeys(false, false);
 }
 
-std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted) {
+std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted, bool guarded = false) {
   auto fixture = std::make_unique<Fixture>();
   const auto material = fixture->Buffer({fixture->UserData(0), fixture->UserData(1),
                                          fixture->UserData(2), fixture->UserData(3)});
@@ -1062,14 +1062,18 @@ std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted) {
   record.data_bits = 32u;
   record.data_dwords = 3u;
   record.formatted = formatted;
+  const auto enabled = guarded ? fixture->Emit(
+      ValueOpcode::INotEqual32, {fixture->UserData(6), Value(0u)}) : Value(true);
   const auto loaded = fixture->Emit(
       ValueOpcode::LoadBufferU32x3,
-      {material, fixture->UserData(6), Value(0u), Value(0u), Value(true)},
+      {material, fixture->UserData(6), Value(0u), Value(0u), enabled},
       fixture->AddMemory(record, 0x60));
   const auto component = fixture->Emit(ValueOpcode::CompositeExtractU32x3,
                                        {loaded, Value(2u)});
+  const auto selected = guarded ? fixture->Emit(
+      ValueOpcode::SelectU32, {enabled, component, Value(0u)}) : component;
   const auto key = fixture->Emit(ValueOpcode::ReadLane,
-                                 {component, Value(0u)});
+                                 {selected, Value(0u)});
   const auto table = fixture->Address(fixture->UserData(4), fixture->UserData(5));
   const auto offset = fixture->Emit(ValueOpcode::ShiftLeftLogical32,
                                    {key, Value(5u)});
@@ -1122,6 +1126,13 @@ void TestBufferRecordImageKey() {
   Check(indirect.has_value() && indirect->record_key &&
             indirect->selector_offset == 8u,
         "lane-selected buffer record was not recognized as an image key");
+  auto guarded = MakeBufferRecordImageFixture(false, true);
+  guarded->PlanAndTrack();
+  const auto &guarded_indirect = guarded->program.descriptor_sources[
+      guarded->program.info.images[0].source].indirect_image;
+  Check(guarded_indirect.has_value() && guarded_indirect->record_key &&
+            guarded_indirect->selector_offset == 8u,
+        "guarded lane-selected record key was not recognized");
 
   auto plan = ExtractResourcePlan(fixture->program);
   LinearTestMemory memory;
@@ -1175,7 +1186,7 @@ void TestBufferRecordImageKey() {
         "written buffer alias with a record key was accepted");
 }
 
-void TestIndirectFormattedXYZBuffer() {
+void TestIndirectFormattedBuffer(uint32_t components) {
   Fixture fixture;
   const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
   const auto key = fixture.Emit(ValueOpcode::ReadFirstLane,
@@ -1196,18 +1207,242 @@ void TestIndirectFormattedXYZBuffer() {
   formatted.kind = ResourceKind::Buffer;
   formatted.formatted = true;
   formatted.data_bits = 32u;
-  formatted.data_dwords = 3u;
+  formatted.data_dwords = components;
   const auto flags = fixture.AddMemory(formatted, 0x44);
-  const auto loaded = fixture.Emit(ValueOpcode::LoadBufferU32x3,
+  const auto loaded = fixture.Emit(components == 2u ? ValueOpcode::LoadBufferU32x2
+                                   : components == 3u ? ValueOpcode::LoadBufferU32x3
+                                                      : ValueOpcode::LoadBufferU32x4,
                                     {buffer, fixture.UserData(2), Value(0u), Value(0u),
                                      Value(true)}, flags);
-  const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x3,
-                                       {loaded, Value(2u)});
+  const auto component = fixture.Emit(components == 2u
+                                          ? ValueOpcode::CompositeExtractU32x2
+                                    : components == 3u
+                                          ? ValueOpcode::CompositeExtractU32x3
+                                          : ValueOpcode::CompositeExtractU32x4,
+                                       {loaded, Value(components - 1u)});
   fixture.Emit(ValueOpcode::ReferenceU32, {component});
   fixture.PlanAndTrack();
   Check(fixture.program.memory_info[flags.index].kind == ResourceKind::IndirectBuffer &&
             fixture.program.info.uses_dma,
-        "dynamic formatted XYZ buffer was not routed through GPU address mapping");
+        "dynamic formatted XY(ZW) buffer was not routed through GPU address mapping");
+}
+
+void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false) {
+  Fixture fixture;
+  const auto material = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                        fixture.UserData(2), fixture.UserData(3)});
+  const auto table = fixture.Address(fixture.UserData(4), fixture.UserData(5));
+  auto selector_word = fixture.UserData(6);
+  if (nested) {
+    const auto records = fixture.Buffer({fixture.UserData(11), fixture.UserData(12),
+                                         fixture.UserData(13), fixture.UserData(14)});
+    const auto index = fixture.Emit(ValueOpcode::BitFieldUExtract,
+        {fixture.UserData(6), Value(16u), Value(2u)});
+    const auto lane_index = fixture.Emit(ValueOpcode::ReadFirstLane, {index, Value(true)});
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+        {lane_index, Value(4u)});
+    MemoryInfo record_read;
+    record_read.kind = ResourceKind::ScalarBuffer;
+    record_read.offset = 8u;
+    selector_word = fixture.Emit(ValueOpcode::ReadConstBuffer,
+        {records, offset}, fixture.AddMemory(record_read, 0x0c));
+  }
+  const auto selector = fixture.Emit(ValueOpcode::ShiftRightLogical32,
+                                      {selector_word, Value(26u)});
+  const auto byte_offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                         {selector, Value(2u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  const auto word = fixture.Emit(ValueOpcode::ReadConstBuffer,
+                                  {material, byte_offset}, fixture.AddMemory(scalar, 0x10));
+  const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                    {word, Value(0xffffu)});
+  const auto key = fixture.Emit(ValueOpcode::IMul32,
+                                 {masked, Value(24u)});
+  const auto table_offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
+       Value(0x100u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); ++dword) {
+    MemoryInfo image_read;
+    image_read.kind = ResourceKind::ScalarAddress;
+    image_read.offset = dword * 4u;
+    image_words[dword] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {table, table_offset, Value(0u), Value(true)},
+        fixture.AddMemory(image_read, 0x20));
+  }
+  const auto image = fixture.Image(image_words, 0x30);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  sample.image_sample_flags = gather ? Decoder::ImageSampleFlagLevelZero : 0u;
+  sample.dmask = 1u;
+  const auto sampled = fixture.Emit(gather ? ValueOpcode::ImageGatherRaw : ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x34));
+  const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                                       {sampled, Value(0u)});
+  const auto output = fixture.Buffer({fixture.UserData(7), fixture.UserData(8),
+                                      fixture.UserData(9), fixture.UserData(10)});
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {output, Value(0u), Value(0u), Value(0u), component, Value(true)},
+               fixture.AddMemory(store, 0x38));
+  fixture.PlanAndTrack();
+  EliminateDeadCode(fixture.program.blocks);
+  const auto &indirect = fixture.program.descriptor_sources[
+      fixture.program.info.images.at(0).source].indirect_image;
+  Check(indirect && indirect->address_key && indirect->address_key_count == 64u &&
+            indirect->key_mask == 0xffffu && indirect->key_scale == 24u,
+        "masked scalar buffer image keys were not recognized");
+  Check(!nested || (indirect->selector_record_source != UINT32_MAX &&
+                     indirect->selector_record_count == 4u &&
+                     indirect->selector_record_stride == 16u &&
+                     indirect->selector_record_offset == 8u),
+        "bounded selector record table was not recognized");
+
+  LinearTestMemory memory;
+  memory.words[1] = 1u;
+  memory.words[2] = 2u;
+  if (nested) {
+    memory.words[0] = 3u;
+    for (uint32_t record = 0; record < 4u; ++record)
+      memory.words[(0x100u + record * 16u + 8u) / 4u] = ((record & 1u) + 1u) << 26u;
+  }
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (uint32_t n = 0; n < (nested ? 4u : 3u); ++n) {
+    if (n == 3u) descriptor[1] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32UInt) << 20u;
+    const auto offset = (0x1100u + n * 24u * 32u) / 4u;
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + offset);
+    memory.words[offset] += n;
+  }
+  std::array<uint32_t, 15> user_data{0x1000u, 4u << 16u, 64u, 0u,
+                                     0x2000u, 0u, 0u,
+                                     0x3000u, 4u << 16u, 1u, 0u,
+                                     0x1100u, 16u << 16u, 4u, 0u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                             snapshot, specialization) &&
+            snapshot.images.size() == (nested ? 2u : 3u) &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] ==
+                (nested ? 2u : 3u),
+        "masked scalar buffer image keys were not materialized");
+  if (nested) {
+    user_data[13] = 3u;
+    Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                                snapshot, specialization) == gather,
+          "out-of-bounds selector record omitted the zero selector");
+    user_data[13] = 4u;
+    memory.words[(0x100u + 8u) / 4u] = 0u;
+    Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                                snapshot, specialization) == gather,
+          "reachable incompatible selector was discarded");
+    if (gather) {
+      ApplyResourceSpecialization(fixture.program, specialization);
+      Check(fixture.program.info.samplers.size() == 2u &&
+                fixture.program.info.sampled_pairs.size() == 3u &&
+                fixture.program.info.samplers[0].integer_border !=
+                    fixture.program.info.samplers[1].integer_border,
+            "mixed gather did not allocate samplers for both numeric classes");
+    }
+  }
+}
+
+void TestStridedHighBitsImageTable(uint32_t clamp = 0u) {
+  Fixture fixture;
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  auto key = fixture.Emit(ValueOpcode::ShiftRightLogical32,
+      {clamp ? fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)})
+             : fixture.UserData(2), Value(26u)});
+  if (clamp) {
+    const auto limit = fixture.UserData(7);
+    key = fixture.Emit(ValueOpcode::UMin32,
+        clamp == 1u ? std::initializer_list<Value>{key, limit}
+                    : std::initializer_list<Value>{limit, key});
+  }
+  const auto record = fixture.Emit(ValueOpcode::IMul32,
+                                    {key, Value(68u)});
+  const auto table_offset = fixture.Emit(ValueOpcode::IAdd32,
+      {record, Value(4u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); ++dword) {
+    MemoryInfo read;
+    read.kind = ResourceKind::ScalarAddress;
+    read.offset = dword * 4u;
+    image_words[dword] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {table, table_offset, Value(0u), Value(true)},
+        fixture.AddMemory(read, 0x20));
+  }
+  const auto image = fixture.Image(image_words, 0x30);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x34));
+  const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                                       {sampled, Value(0u)});
+  const auto output = fixture.Buffer({fixture.UserData(3), fixture.UserData(4),
+                                      fixture.UserData(5), fixture.UserData(6)});
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {output, Value(0u), Value(0u), Value(0u), component, Value(true)},
+               fixture.AddMemory(store, 0x38));
+  fixture.PlanAndTrack();
+  EliminateDeadCode(fixture.program.blocks);
+  const auto &indirect = fixture.program.descriptor_sources[
+      fixture.program.info.images.at(0).source].indirect_image;
+  Check(indirect && indirect->table_stride == 68u &&
+            indirect->table_offset == 4u &&
+            (clamp ? !indirect->key_count.IsImmediate()
+                   : indirect->key_count.IsImmediate() && indirect->key_count.U32() == 64u),
+        "bounded strided image table was not recognized");
+
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  std::copy(descriptor.begin(), descriptor.end(),
+            memory.words.begin() + (68u + 4u) / 4u);
+  if (clamp) memory.fail_address = memory.base + 2u * 68u + 4u;
+  std::array<uint32_t, 8> user_data{0x1000u, 0u, 0u,
+                                    0x3000u, 4u << 16u, 1u, 0u, 1u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                             snapshot, specialization) &&
+            snapshot.flattened_srt.size() == (clamp ? 5u : 129u) &&
+            snapshot.flattened_srt[0] == (clamp ? 2u : 64u) &&
+            snapshot.images.size() == 2u,
+        "bounded strided image table was not materialized");
+  if (clamp) {
+    user_data[7] = UINT32_MAX;
+    memory.fail_address = UINT64_MAX;
+    Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                               snapshot, specialization) &&
+              snapshot.flattened_srt[0] == 64u,
+          "runtime image limit overflowed the bounded table count");
+  }
 }
 
 void TestGuardedDirectImageTable() {
@@ -3826,7 +4061,15 @@ int main() {
     Run("shared uniform loop index", TestSharedUniformLoopIndex);
     Run("bounded address image keys", TestBoundedAddressImageKeys);
     Run("buffer record image key", TestBufferRecordImageKey);
-    Run("indirect formatted XYZ buffer", TestIndirectFormattedXYZBuffer);
+    Run("indirect formatted XY buffer", [] { TestIndirectFormattedBuffer(2u); });
+    Run("indirect formatted XYZ buffer", [] { TestIndirectFormattedBuffer(3u); });
+    Run("indirect formatted XYZW buffer", [] { TestIndirectFormattedBuffer(4u); });
+    Run("masked scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(); });
+    Run("nested scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(true); });
+    Run("mixed numeric indirect gather", [] { TestMaskedScalarBufferImageKeys(true, true); });
+    Run("strided high-bits image table", [] { TestStridedHighBitsImageTable(); });
+    Run("clamped high-bits image table", [] { TestStridedHighBitsImageTable(1u); });
+    Run("reversed clamped image table", [] { TestStridedHighBitsImageTable(2u); });
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);

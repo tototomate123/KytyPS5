@@ -765,8 +765,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
-			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
-			                            dimension_info.coordinate_components, image.cube);
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod)) {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 				if (!warned.test_and_set(std::memory_order_relaxed)) {
@@ -775,62 +773,90 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					           stderr);
 				}
 			}
-			if (dimension == ImageDimension::Dim1D) {
-				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
-				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
-				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
-					ctx.Fail(inst, "has an unsupported 1D gather variant");
-					return;
+			const auto EmitGather = [&](uint32_t resource) {
+				auto candidate_memory     = mem;
+				candidate_memory.resource = resource;
+				if (resource != mem.resource) {
+					const auto source = state.program.info.samplers[mem.sampler].source;
+					const auto pair   = std::ranges::find_if(
+					    state.program.info.sampled_pairs, [&](const auto& pair) {
+						    return pair.image == resource &&
+						           state.program.info.samplers[pair.sampler].source == source;
+					    });
+					if (pair == state.program.info.sampled_pairs.end()) {
+						ctx.Fail(inst, "has no indirect gather candidate sampler");
+						return uint32_t {0};
+					}
+					candidate_memory.sampler = pair->sampler;
 				}
-				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class);
-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-				                              numeric_class, false, mem, true));
-				return;
-			}
-			if (dimension == ImageDimension::Dim1DArray) {
-				ctx.Fail(inst, "has an unsupported 1D-array gather");
-				return;
-			}
-			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
-			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words;
-			if (dref) {
-				auto dref_value = ZeroF32(state);
-				if (layout.dref != NoImageComponent) {
-					dref_value = AddressF32(ctx, mem, *address, layout.dref);
+				const auto& candidate     = state.program.info.images[resource];
+				const auto  dimension     = candidate.dimension;
+				const auto  numeric_class = candidate.numeric_class;
+				const auto  coord =
+				    CoordF32(ctx, candidate_memory, *address, layout.coord,
+				             ImageDimensionInfoFor(dimension).coordinate_components, candidate.cube,
+				             ImageDimensionInfoFor(mem.image_dimension).coordinate_components);
+				if (dimension == ImageDimension::Dim1D) {
+					if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
+					    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
+					    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+						ctx.Fail(inst, "has an unsupported 1D gather variant");
+						return uint32_t {0};
+					}
+					const auto sample =
+					    EmitOneDimensionalGatherLz(ctx, candidate_memory, coord, numeric_class);
+					return ResultVector(ctx, UnpackImageGather(ctx, candidate_memory, sample),
+					                    numeric_class, false, candidate_memory, true);
 				}
-				words = {spv::OpImageDrefGather,
-				         TypeF32Vector(state, 4),
-				         sample,
-				         sampled,
-				         coord,
-				         dref_value};
-			} else {
-				uint32_t component = 0;
-				if (ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid) {
-					component = ImageGatherComponent(mem.dmask);
+				if (dimension == ImageDimension::Dim1DArray) {
+					ctx.Fail(inst, "has an unsupported 1D-array gather");
+					return uint32_t {0};
 				}
-				words = {spv::OpImageGather,
-				         ImageVectorType(state, numeric_class, 4),
-				         sample,
-				         sampled,
-				         coord,
-				         ConstantU32(state, component)};
-			}
-			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
-				words.push_back(spv::ImageOperandsConstOffsetsMask);
-				words.push_back(HorizontalOffsets(state, dimension));
-			} else if (layout.offset != NoImageComponent) {
-				words.push_back(spv::ImageOperandsOffsetMask);
-				words.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
-			}
-			state.builder.AddFunction(words);
-			auto result_numeric_class = numeric_class;
-			if (dref) {
-				result_numeric_class = Prospero::TextureNumericClass::Float;
-			}
-			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-			                              result_numeric_class, false, mem, true));
+				const auto sampled = MakeSampledImage(state, resource, candidate_memory.sampler);
+				const auto sample  = state.builder.AllocateId();
+				std::vector<uint32_t> words;
+				if (dref) {
+					auto dref_value = ZeroF32(state);
+					if (layout.dref != NoImageComponent) {
+						dref_value = AddressF32(ctx, mem, *address, layout.dref);
+					}
+					words = {spv::OpImageDrefGather,
+					         TypeF32Vector(state, 4),
+					         sample,
+					         sampled,
+					         coord,
+					         dref_value};
+				} else {
+					uint32_t component = 0;
+					if (ImageConversionFormat(state, candidate_memory).format ==
+					    Prospero::BufferFormat::kInvalid) {
+						component = ImageGatherComponent(mem.dmask);
+					}
+					words = {spv::OpImageGather,
+					         ImageVectorType(state, numeric_class, 4),
+					         sample,
+					         sampled,
+					         coord,
+					         ConstantU32(state, component)};
+				}
+				if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+					words.push_back(spv::ImageOperandsConstOffsetsMask);
+					words.push_back(HorizontalOffsets(state, dimension));
+				} else if (layout.offset != NoImageComponent) {
+					words.push_back(spv::ImageOperandsOffsetMask);
+					words.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
+				}
+				state.builder.AddFunction(words);
+				auto result_numeric_class = numeric_class;
+				if (dref) {
+					result_numeric_class = Prospero::TextureNumericClass::Float;
+				}
+				return ResultVector(ctx, UnpackImageGather(ctx, candidate_memory, sample),
+				                    result_numeric_class, false, candidate_memory, true);
+			};
+			const auto result =
+			    EmitImageCandidateSwitch(ctx, inst, mem, TypeU32Vector(state, 4), EmitGather);
+			if (result != 0u) ctx.Define(inst, result);
 			return;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||

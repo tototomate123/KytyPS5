@@ -273,13 +273,20 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
 		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
 		if (table_value.dword_count != 2u || !evaluated || key_count > MaxIndirectImageProbes ||
-		    uint64_t {indirect.table_offset} + uint64_t {key_count} * 32u > UINT32_MAX + 1ull) {
-			return false;
+		    indirect.table_stride < 32u ||
+		    uint64_t {indirect.table_offset} +
+		        uint64_t {key_count} * indirect.table_stride > UINT32_MAX + 1ull) {
+			return SpecializationFail(fmt::format(
+			    "shader=0x{:016x} indirect image {} key count failed "
+			    "(evaluated={}, count={}, table base=0x{:x}, offset={}, stride={})",
+			    program.shader_hash, image_index, evaluated, key_count, table_base,
+			    indirect.table_offset, indirect.table_stride));
 		}
 		keys.resize(key_count);
 		std::iota(keys.begin(), keys.end(), 0u);
 	} else if (indirect.address_key) {
-		if (material_value.dword_count != 2u || table_value.dword_count != 2u ||
+		if ((material_value.dword_count != 2u && material_value.dword_count != 4u) ||
+		    table_value.dword_count != 2u ||
 		    indirect.address_key_count == 0u ||
 		    indirect.address_key_count > MaxIndirectImageProbes ||
 		    uint64_t {indirect.selector_offset} +
@@ -287,14 +294,46 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 		        uint64_t {UINT32_MAX} + 1u) {
 			return false;
 		}
-		const auto material_base =
+		uint64_t material_base =
 		    (static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0];
+		uint64_t material_size = UINT64_MAX;
+		if (material_value.dword_count == 4u) {
+			ShaderBufferResource material;
+			if (!DecodeBufferDescriptor(material_value, material)) return false;
+			material_base = material.Base48();
+			material_size = material.GetSize();
+		}
 		std::vector<uint32_t> words(indirect.address_key_count);
-		if (!ReadScalarTable(material_base, UINT64_MAX, indirect.selector_offset, runtime, words))
+		if (!ReadScalarTable(material_base, material_size, indirect.selector_offset, runtime, words))
 			return false;
 		keys.reserve(words.size());
-		for (const auto word: words) {
-			keys.push_back(word * indirect.key_scale + indirect.key_bias);
+		auto add_key = [&](uint32_t selector) {
+			const auto word = words[selector];
+			keys.push_back((word & indirect.key_mask) * indirect.key_scale + indirect.key_bias);
+		};
+		if (indirect.selector_record_source != UINT32_MAX) {
+			DescriptorValue record_value;
+			ShaderBufferResource records;
+			if (!clean.EvaluateDescriptor(indirect.selector_record_source, record_value) ||
+			    !DecodeBufferDescriptor(record_value, records) ||
+			    indirect.selector_record_count == 0u ||
+			    indirect.selector_record_count > MaxIndirectImageProbes ||
+			    indirect.selector_record_shift >= 32u) return false;
+			for (uint32_t record = 0; record < indirect.selector_record_count; ++record) {
+				const uint64_t offset = uint64_t {record} * indirect.selector_record_stride +
+				                        indirect.selector_record_offset;
+				uint32_t word = 0;
+				if (offset > UINT32_MAX ||
+				    !ReadScalarTable(records.Base48(), records.GetSize(), offset, runtime, {&word, 1}))
+					return false;
+				const auto selector = word >> indirect.selector_record_shift;
+				if (selector >= words.size()) return false;
+				add_key(selector);
+				// Every remaining record is out of bounds and returns the same zero word.
+				if (offset >= records.GetSize()) break;
+			}
+		} else {
+			for (uint32_t selector = 0; selector < words.size(); ++selector) add_key(selector);
 		}
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -332,7 +371,7 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 			DescriptorValue candidate;
 			candidate.dword_count = 8u;
 			const auto offset = static_cast<uint64_t>(indirect.table_offset) +
-			                    static_cast<uint64_t>(key) * 32u;
+			                    static_cast<uint64_t>(key) * indirect.table_stride;
 			if (offset > UINT32_MAX ||
 			    !ReadScalarTable(table_base, table_size, offset, runtime, candidate.dwords)) {
 				continue;
@@ -460,7 +499,7 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 		const auto      key = keys[entry];
 		DescriptorValue candidate;
 		candidate.dword_count   = 8u;
-		const auto table_offset = (key << 5u) + indirect.table_offset;
+		const auto table_offset = key * indirect.table_stride + indirect.table_offset;
 		const bool read_ok = (zero_selector_count && key == UINT32_MAX) ||
 		                     ReadScalarTable(table_base, table_size, table_offset, runtime,
 		                                     candidate.dwords);
@@ -491,7 +530,11 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 			ordinal = static_cast<uint32_t>(found - snapshot.images.begin() - children_begin + 1u);
 			if (found == snapshot.images.end()) {
 				if (snapshot.images.size() >= ShaderInfo::MaxImages) {
-					return false;
+					return SpecializationFail(fmt::format(
+					    "shader=0x{:016x} indirect image {} exceeds image limit at key {} "
+					    "(keys={}, table base=0x{:x}, offset={}, stride={})",
+					    program.shader_hash, image_index, key, keys.size(), table_base,
+					    indirect.table_offset, indirect.table_stride));
 				}
 				snapshot.images.push_back(candidate);
 				auto child          = root_image;
@@ -726,7 +769,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates =
 			    image.dimension == image_class.dimension && image.cube == image_class.cube;
-			if (image.numeric_class != image_class.numeric_class ||
+			const bool gather_types = program.info.images[root_index].gather_only &&
+			                          !program.info.images[root_index].depth_compare;
+			if ((!gather_types && image.numeric_class != image_class.numeric_class) ||
 			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
 			     !(allow_2d_3d && is_2d_or_3d(image.dimension) &&
 			       is_2d_or_3d(image_class.dimension))) ||
@@ -790,6 +835,10 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 			return false;
 		}
 		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(images[pair.image]));
+		for (const auto& image: images) {
+			if (image.indirect_root == pair.image)
+				usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(image));
+		}
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];
@@ -1109,7 +1158,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		                   plan.clean_flat_slots, source->indirect_image->selector_mask);
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots,
 		                   source->indirect_image->selector_count);
+		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots,
+		                   source->indirect_image->key_count);
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
+		                   plan.clean_flat_slots);
+		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->selector_record_source),
 		                   plan.clean_flat_slots);
 	}
 	if (protected_image) {
@@ -1303,6 +1356,15 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
 	auto samplers      = program.info.samplers;
 	auto sampled_pairs = program.info.sampled_pairs;
+	for (const auto& pair: program.info.sampled_pairs) {
+		for (uint32_t candidate = 0; candidate < images.size(); ++candidate) {
+			if (candidate != pair.image && images[candidate].indirect_root == pair.image) {
+				auto child = pair;
+				child.image = candidate;
+				sampled_pairs.push_back(child);
+			}
+		}
+	}
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];
@@ -1404,6 +1466,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			if (image.indirect_root == memory.resource &&
 			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			    inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
 			    inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
 			    inst.GetOpcode() != ValueOpcode::ImageRead) {
 				EXIT("unsupported indirect image operation: shader=0x%016llx pc=0x%08x "

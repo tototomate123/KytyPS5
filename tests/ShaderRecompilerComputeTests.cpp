@@ -29299,6 +29299,37 @@ void CheckIndirectImageKeySwitch() {
               CountText(text, "OpIEqual") == 11,
           "dynamic image key did not use a compact two-sample switch");
 
+  sample.ReplaceOpcode(ValueOpcode::ImageGatherRaw);
+  program.memory_info[0].dmask = 1u;
+  program.memory_info[0].image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLevelZero;
+  program.memory_info[0].image_address_components = 2u;
+  auto integer_sampler = program.info.samplers[0];
+  integer_sampler.integer_border = true;
+  program.info.samplers.push_back(integer_sampler);
+  for (const bool integer_first : {false, true}) {
+    program.info.images = {root, candidate};
+    program.info.images[integer_first ? 0u : 1u].numeric_class =
+        Prospero::TextureNumericClass::Uint;
+    program.info.sampled_pairs = {{0u, integer_first ? 1u : 0u, 0x10f0u},
+                                  {1u, integer_first ? 0u : 1u, 0x10f0u}};
+    program.memory_info[0].sampler = integer_first ? 1u : 0u;
+    program.binding_layout_complete = false;
+    AllocateBindings(program);
+    spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv(name, spirv);
+    Require(name, "mixed gather disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble mixed numeric gather shader");
+    Require(name, "mixed gather switch",
+            CountText(text, "OpImageGather") == 2u &&
+                text.find("OpPhi") != std::string::npos &&
+                text.find("OpBitcast") != std::string::npos,
+            "mixed numeric gather did not merge two typed results as raw words");
+  }
+  sample.ReplaceOpcode(ValueOpcode::ImageSampleRaw);
+  program.memory_info[0] = memory;
+  program.info.samplers.resize(1u);
+  program.info.sampled_pairs = {{0u, 0u, 0x10f0u}};
+
   program.memory_info[0].image_dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
   program.memory_info[0].image_address_components = 4;
@@ -32731,6 +32762,15 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA01530 max-mip storage descriptor fixture is malformed");
   ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), max_mip,
                          0x20000);
+  const ShaderTextureResource hfw_array{{
+      0x02e67000u, 0xc2400008u, 0x003fc03fu, 0xd1b003acu,
+      0x00000005u, 0x00600060u, 0x00000000u, 0x00000000u}};
+  Require("BasicStorageTexture", "HFW storage array descriptor",
+          hfw_array.Type() == Prospero::ImageType::kColor2DArray &&
+              hfw_array.PerfMod5() == 6 && hfw_array.MaxMip() == 6,
+          "HFW storage array descriptor fixture is malformed");
+  ValidateStorageTexture(BasicUintArrayStorageTextureResource(), hfw_array,
+                         0x240000);
   auto mip_one = max_mip;
   mip_one.fields[3] |= (1u << 12u) | (1u << 16u);
   Require("BasicStorageTexture", "PPSA01530 mip-one descriptor",

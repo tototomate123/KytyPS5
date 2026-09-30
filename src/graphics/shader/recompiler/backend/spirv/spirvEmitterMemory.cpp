@@ -819,24 +819,43 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	const auto format = field(word3, 12, 7);
 	auto valid_format = nonzero(format);
 	if (ctx.Memory(inst).formatted) {
-		const auto in_range = AndCondition(
+		const auto wide_first = components == 4u
+		                            ? Prospero::BufferFormat::k32_32_32_32UInt
+		                            : Prospero::BufferFormat::k32_32_32UInt;
+		const auto wide_format = AndCondition(
 		    state,
 		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), format,
-		           ConstantU32(state, static_cast<uint32_t>(
-		                                  Prospero::BufferFormat::k32_32_32UInt))),
+		           ConstantU32(state, static_cast<uint32_t>(wide_first))),
 		    Binary(state, spv::OpULessThanEqual, TypeBool(state), format,
 		           ConstantU32(state, static_cast<uint32_t>(
 		                                  Prospero::BufferFormat::k32_32_32_32Float))));
-		const auto identity_xyz = AndCondition(
+		const auto two_word_format = AndCondition(
+		    state,
+		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(Prospero::BufferFormat::k32_32UInt))),
+		    Binary(state, spv::OpULessThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(Prospero::BufferFormat::k32_32Float))));
+		const auto in_range = components == 2u
+		                          ? Binary(state, spv::OpLogicalOr, TypeBool(state),
+		                                   two_word_format, wide_format)
+		                          : wide_format;
+		const auto identity_xy = AndCondition(
 		    state,
 		    Binary(state, spv::OpIEqual, TypeBool(state), field(word3, 0, 3),
 		           ConstantU32(state, 4u)),
-		    AndCondition(state,
-		                 Binary(state, spv::OpIEqual, TypeBool(state), field(word3, 3, 3),
-		                        ConstantU32(state, 5u)),
-		                 Binary(state, spv::OpIEqual, TypeBool(state), field(word3, 6, 3),
-		                        ConstantU32(state, 6u))));
-		valid_format = AndCondition(state, in_range, identity_xyz);
+		    Binary(state, spv::OpIEqual, TypeBool(state), field(word3, 3, 3),
+		           ConstantU32(state, 5u)));
+		const auto identity_xyz = components == 2u
+		                              ? identity_xy
+		                              : AndCondition(state, identity_xy,
+		                                             Binary(state, spv::OpIEqual, TypeBool(state),
+		                                                    field(word3, 6, 3), ConstantU32(state, 6u)));
+		const auto identity = components == 4u
+		                          ? AndCondition(state, identity_xyz,
+		                                         Binary(state, spv::OpIEqual, TypeBool(state),
+		                                                field(word3, 9, 3), ConstantU32(state, 7u)))
+		                          : identity_xyz;
+		valid_format = AndCondition(state, in_range, identity);
 	}
 	const auto mode            = field(word3, 28, 2);
 	const auto index_in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, records);

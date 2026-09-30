@@ -73,10 +73,12 @@ struct MemoryInfo {
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed || data_bits != 32u) return false;
 		if (formatted) {
-			// A dynamic buffer descriptor can be read directly when each XYZ
+			// A dynamic buffer descriptor can be read directly when each XY(ZW)
 			// component occupies one complete DWORD. The emitter checks the
 			// runtime format and channel order before loading.
-			return opcode == ValueOpcode::LoadBufferU32x3 && data_dwords == 3u;
+			return (opcode == ValueOpcode::LoadBufferU32x2 && data_dwords == 2u) ||
+			       (opcode == ValueOpcode::LoadBufferU32x3 && data_dwords == 3u) ||
+			       (opcode == ValueOpcode::LoadBufferU32x4 && data_dwords == 4u);
 		}
 		return opcode == ValueOpcode::LoadBufferU32x2 ||
 		       opcode == ValueOpcode::LoadBufferU32x3 ||
@@ -142,6 +144,7 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          simple_2d_3d_sampling      = false;
+	bool                          gather_only                = false;
 	uint32_t                      indirect_root              = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset    = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -478,14 +481,21 @@ struct DescriptorSource {
 		uint32_t selector_offset = 0;
 		uint32_t selector_limit  = 0;
 		uint32_t table_offset    = 0;
+		uint32_t table_stride    = 32;
 		Value    key_count;
 		Value    selector_count;
 		Value    selector_mask;
 		bool     record_key        = false;
 		bool     address_key       = false;
 		uint32_t address_key_count = 0;
+		uint32_t key_mask          = UINT32_MAX;
 		uint32_t key_scale         = 1;
 		uint32_t key_bias          = 0;
+		uint32_t selector_record_source = UINT32_MAX;
+		uint32_t selector_record_count  = 0;
+		uint32_t selector_record_stride = 0;
+		uint32_t selector_record_offset = 0;
+		uint32_t selector_record_shift  = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

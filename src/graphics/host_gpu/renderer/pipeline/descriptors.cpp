@@ -281,8 +281,8 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
                                               const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
-	constexpr uint32_t field5_expected      = 0x00700000u;
-	constexpr uint32_t field5_max_mip_mask  = 0x000000f0u;
+	const uint32_t field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	                                 (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
 	const uint32_t     expected_field3 = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
 	                                     (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
@@ -298,7 +298,7 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 		       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
 	}
 	return common && descriptor.fields[4] == expected_field4 &&
-	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
+	       descriptor.fields[5] == field5_expected;
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,

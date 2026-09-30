@@ -7719,6 +7719,34 @@ public:
               "stale native bytes");
       DestroyBuffer(&alias_readback);
 
+      // More protected tiled images than the pressured scan budget must not
+      // prevent a later clean texture from being reclaimed.
+      std::array<ImageId, 22> blocked_gc_images{};
+      for (size_t index = 0; index < blocked_gc_images.size(); ++index) {
+        auto desc = MakeLinearDesc(
+            base + 0x380000 + index * 0x1000, 256,
+            vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {8, 8, 1}, 1, 4, 1);
+        if (index + 1u < blocked_gc_images.size()) {
+          desc.info.tile_mode = Prospero::TileMode::kStandard256B;
+        }
+        blocked_gc_images[index] = texture_cache.FindImage(desc);
+        if (index + 1u < blocked_gc_images.size()) {
+          texture_cache.MarkGpuWritten(blocked_gc_images[index]);
+        }
+      }
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, blocked_gc_images, 81, 0);
+      texture_cache.RunGarbageCollector();
+      Require(name, "protected tiled images do not starve reclamation",
+              std::ranges::all_of(
+                  std::span(blocked_gc_images).first(21), [&](ImageId id) {
+                    return TextureCacheTestAccess::Contains(texture_cache, id) &&
+                           texture_cache.GetImage(id).SafeToDownload();
+                  }) &&
+                  !TextureCacheTestAccess::Contains(texture_cache, blocked_gc_images.back()),
+              "GC discarded protected GPU data or failed to reach a later clean image");
+
       constexpr uint64_t submit_readback_offset = 0x336000;
       constexpr uint32_t submit_readback_value = 0x13579bdfu;
       constexpr uint32_t submit_readback_stale = 0x2468ace0u;

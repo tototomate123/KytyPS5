@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/loadDiagnostics.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -1973,6 +1974,9 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	const auto before = m_total_used_memory;
+	size_t scanned = 0, freed = 0, retained_tiled = 0, failed_download = 0;
+	uint64_t freed_bytes = 0;
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
@@ -1983,6 +1987,18 @@ void TextureCache::RunGarbageCollector() {
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+			++scanned;
+			const auto owner = m_slot_images.try_get(id);
+			// Protected GPU contents cannot be retired. Do not let the same oldest
+			// entries consume every pass's candidate budget and hide reclaimable images.
+			if (owner != nullptr && owner->registered && !owner->depth_id &&
+			    owner->SafeToDownload()) {
+				if (owner->info.IsTiled()) {
+					++retained_tiled;
+					return false;
+				}
+				if (!pressured) return false;
+			}
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});
@@ -1998,15 +2014,19 @@ void TextureCache::RunGarbageCollector() {
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
 				if (safe && owner->info.IsTiled()) {
+					++retained_tiled;
 					continue;
 				}
 				if (safe && !pressured) {
 					continue;
 				}
 				if (safe && !DownloadImageMemory(id)) {
+					++failed_download;
 					continue;
 				}
 			}
+			freed_bytes += owner->AccountedSize();
+			++freed;
 			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
@@ -2021,6 +2041,14 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed) &&
+	    before >= m_pressure_gc_memory && tick % 64u == 0u) {
+		std::fprintf(stderr, "HFW texture GC: tick=%" PRIu64 " usage=%" PRIu64
+		             " pressure=%" PRIu64 " critical=%" PRIu64 " scanned=%zu freed=%zu bytes=%" PRIu64
+		             " retained_tiled=%zu failed_download=%zu\n",
+		             tick, before, m_pressure_gc_memory, m_critical_gc_memory, scanned, freed, freed_bytes,
+		             retained_tiled, failed_download);
 	}
 }
 

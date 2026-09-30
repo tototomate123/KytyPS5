@@ -846,6 +846,7 @@ private:
 				    a.selector_record_shift != b.selector_record_shift ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    !EquivalentValue(m_program, a.selector_count, b.selector_count) ||
+				    !EquivalentValue(m_program, a.runtime_key_bias, b.runtime_key_bias) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
 				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask)))
@@ -1557,8 +1558,27 @@ private:
 	}
 
 	bool MatchMaskedConstBufferKey(Value key, DescriptorSource& material_source,
-	                               DescriptorSource::IndirectImage& indirect) {
+	                               DescriptorSource::IndirectImage& indirect, uint32_t depth = 0u) {
+		if (depth > 8u) return false;
 		const auto* multiply = key.Resolve().TryInstruction();
+		if (multiply != nullptr && multiply->GetOpcode() == ValueOpcode::IAdd32 &&
+		    multiply->NumArgs() == 2u) {
+			for (uint32_t side = 0; side < 2u; ++side) {
+				const auto bias = multiply->Arg(side ^ 1u);
+				DescriptorSource source;
+				auto candidate = indirect;
+				if (!ValidateRuntimeValue(m_program, bias, RuntimeValueType::Integer) ||
+				    !MatchMaskedConstBufferKey(multiply->Arg(side), source, candidate, depth + 1u) ||
+				    !candidate.runtime_key_bias.IsEmpty()) continue;
+				uint32_t immediate = 0;
+				if (ImmediateU32(bias, immediate)) candidate.key_bias += immediate;
+				else candidate.runtime_key_bias = bias;
+				material_source = source;
+				indirect = candidate;
+				return true;
+			}
+			return false;
+		}
 		uint32_t scale = 1u;
 		Value masked = key;
 		// A larger descriptor stride can carry the scale in the table address

@@ -381,9 +381,15 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 		if (!ReadScalarTable(material_base, material_size, indirect.selector_offset, runtime, words))
 			return false;
 		keys.reserve(words.size());
+		uint32_t bias = indirect.key_bias;
+		if (!indirect.runtime_key_bias.IsEmpty()) {
+			uint32_t runtime_bias = 0;
+			if (!clean.Evaluate(indirect.runtime_key_bias, runtime_bias)) return false;
+			bias += runtime_bias;
+		}
 		auto add_key = [&](uint32_t selector) {
 			const auto word = words[selector];
-			keys.push_back((word & indirect.key_mask) * indirect.key_scale + indirect.key_bias);
+			keys.push_back((word & indirect.key_mask) * indirect.key_scale + bias);
 		};
 		if (indirect.selector_record_source != UINT32_MAX) {
 			DescriptorValue record_value;
@@ -1200,6 +1206,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			target.indirect_image->key_count     = Clone(target.indirect_image->key_count);
 			target.indirect_image->selector_count = Clone(target.indirect_image->selector_count);
 			target.indirect_image->selector_mask = Clone(target.indirect_image->selector_mask);
+			target.indirect_image->runtime_key_bias = Clone(target.indirect_image->runtime_key_bias);
 		}
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);
@@ -1234,6 +1241,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		                   source->indirect_image->selector_count);
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots,
 		                   source->indirect_image->key_count);
+		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots,
+		                   source->indirect_image->runtime_key_bias);
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->selector_record_source),

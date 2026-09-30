@@ -491,6 +491,7 @@ struct DescriptorSource {
 		uint32_t key_mask          = UINT32_MAX;
 		uint32_t key_scale         = 1;
 		uint32_t key_bias          = 0;
+		Value    runtime_key_bias;
 		uint32_t selector_record_source = UINT32_MAX;
 		uint32_t selector_record_count  = 0;
 		uint32_t selector_record_stride = 0;

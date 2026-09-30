@@ -1446,7 +1446,8 @@ void TestIndirectFormattedBuffer(uint32_t components) {
 }
 
 void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, bool clamped = false,
-                                    uint32_t image_write = 0u, bool strided_table = false) {
+                                    uint32_t image_write = 0u, bool strided_table = false,
+                                    uint32_t runtime_bias = 0u) {
   Fixture fixture;
   const auto material = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
                                         fixture.UserData(2), fixture.UserData(3)});
@@ -1478,8 +1479,11 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
                                   {material, byte_offset}, fixture.AddMemory(scalar, 0x10));
   const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
                                     {word, Value(0xffffu)});
-  const auto key = strided_table ? masked : fixture.Emit(ValueOpcode::IMul32,
-                                                         {masked, Value(24u)});
+  auto key = strided_table ? masked : fixture.Emit(ValueOpcode::IMul32,
+                                                    {masked, Value(24u)});
+  if (runtime_bias) key = fixture.Emit(ValueOpcode::IAdd32,
+      {key, runtime_bias == 2u ? fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)})
+                             : fixture.UserData(16)});
   const auto table_offset = fixture.Emit(ValueOpcode::IAdd32,
       {strided_table ? fixture.Emit(ValueOpcode::IMul32, {key, Value(768u)}) :
                       fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
@@ -1536,6 +1540,11 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
                   {target, fixture.ImageAddress(), data, Value(true)},
                   fixture.AddMemory(write, 0x3c));
   }
+  if (runtime_bias == 2u) {
+    CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+               "varying texture-key bias was accepted as a runtime value");
+    return;
+  }
   fixture.PlanAndTrack();
   EliminateDeadCode(fixture.program.blocks);
   const auto &indirect = fixture.program.descriptor_sources[
@@ -1570,14 +1579,14 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
   for (uint32_t n = 0; n < (nested ? 4u : 3u); ++n) {
     if (n == 3u) descriptor[1] = static_cast<uint32_t>(
         Libs::Graphics::Prospero::BufferFormat::k32UInt) << 20u;
-    const auto offset = (0x1100u + n * 24u * 32u) / 4u;
+    const auto offset = (0x1100u + n * 24u * 32u + (runtime_bias ? 32u : 0u)) / 4u;
     std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + offset);
     memory.words[offset] += n;
   }
-  std::array<uint32_t, 16> user_data{0x1000u, 4u << 16u, 64u, 0u,
+  std::array<uint32_t, 17> user_data{0x1000u, 4u << 16u, 64u, 0u,
                                      0x2000u, 0u, 0u,
                                      0x3000u, 4u << 16u, 1u, 0u,
-                                     0x1100u, 16u << 16u, 4u, 0u, 1u};
+                                     0x1100u, 16u << 16u, 4u, 0u, 1u, 1u};
   if (clamped) memory.fail_address = memory.base + 8u;
   const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
                            .read_specialization_memory = ReadLinearTestMemory};
@@ -1595,6 +1604,20 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
             snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] ==
                 (nested || clamped ? 2u : 3u),
         "masked scalar buffer image keys were not materialized");
+  if (runtime_bias) {
+    const auto mapping = specialization.images[0].indirect_mapping_offset;
+    Check(snapshot.flattened_srt[mapping + 1u] == 1u,
+          "runtime bias was omitted from the texture-key mapping");
+    for (uint32_t n = 0; n < 3u; ++n) {
+      const auto offset = (0x1100u + n * 768u + 32u) / 4u;
+      std::copy_n(memory.words.begin() + offset, 8u, memory.words.begin() + offset + 8u);
+    }
+    user_data[16] = 2u;
+    Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                                snapshot, specialization) &&
+              snapshot.flattened_srt[mapping + 1u] == 2u,
+          "changed runtime texture-key bias retained the old mapping");
+  }
   if (clamped) {
     memory.fail_address = UINT64_MAX;
     user_data[15] = UINT32_MAX;
@@ -4522,6 +4545,10 @@ int main() {
     Run("masked scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(); });
     Run("strided masked scalar buffer image keys", [] {
       TestMaskedScalarBufferImageKeys(false, false, false, 0u, true);
+    });
+    Run("biased masked scalar buffer image keys", [] {
+      TestMaskedScalarBufferImageKeys(false, false, false, 0u, false, 1u);
+      TestMaskedScalarBufferImageKeys(false, false, false, 0u, false, 2u);
     });
     Run("clamped scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(false, false, true); });
     Run("specialization with image writes", [] {

@@ -1447,7 +1447,8 @@ void TestStridedHighBitsImageTable(uint32_t clamp = 0u) {
 
 void TestGuardedDirectImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  enum class Guard { Nonzero, SccNonZero, Plain, Zero, Unrelated, Bypass, ExecZero, VccZero };
+  enum class Guard { Nonzero, SccNonZero, Plain, Zero, Unrelated, Bypass, ExecZero, VccZero,
+                     SentinelMasked, SentinelMaskedWritten, SentinelUnmasked };
   const auto make_plan = [](Guard guard) {
     Fixture fixture(ShaderType::Pixel);
     fixture.program.wave_size = 64u;
@@ -1464,10 +1465,14 @@ void TestGuardedDirectImageTable() {
     if (guard == Guard::Bypass) exit->AddBranch(sample);
     const auto mask = fixture.Emit(ValueOpcode::ReadFirstLane,
         {fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)}), Value(true)});
+    const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const bool masked = guard == Guard::SentinelMasked || guard == Guard::SentinelMaskedWritten;
+    const bool sentinel = masked || guard == Guard::SentinelUnmasked;
     const auto nonzero = fixture.Emit(
         ValueOpcode::INotEqual32,
-        {Value(0u), guard == Guard::Unrelated ? fixture.UserData(2) : mask});
-    const auto kind = guard == Guard::ExecZero ? CFG::BranchCondition::ExecZero
+        {Value(sentinel ? UINT32_MAX : 0u), sentinel ? key :
+            guard == Guard::Unrelated ? fixture.UserData(2) : mask});
+    const auto kind = guard == Guard::ExecZero || sentinel ? CFG::BranchCondition::ExecZero
                     : guard == Guard::VccZero ? CFG::BranchCondition::VccZero
                                              : CFG::BranchCondition::SccZero;
     auto condition = nonzero;
@@ -1503,7 +1508,6 @@ void TestGuardedDirectImageTable() {
           fixture.AddMemory(memory, 0x20));
     }
     fixture.block = sample;
-    const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
     const auto offset = fixture.Emit(ValueOpcode::IAdd32,
         {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
          Value(344u)});
@@ -1528,8 +1532,25 @@ void TestGuardedDirectImageTable() {
     MemoryInfo memory;
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+    const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
                  fixture.AddMemory(memory, 0x128));
+    if (masked) {
+      const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
+      const auto selected = fixture.Emit(ValueOpcode::SelectU32, {nonzero, component, Value(0u)});
+      fixture.Emit(ValueOpcode::ReferenceU32, {selected});
+    }
+    if (guard == Guard::SentinelMaskedWritten) {
+      const auto output = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                         Value(0u), Value(0u), Value(0u), Value(0u)});
+      MemoryInfo write;
+      write.kind = ResourceKind::Image;
+      write.image_dimension = Decoder::ImageDimension::Dim2D;
+      const auto data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+                                     {Value(0u), Value(0u), Value(0u), Value(0u)});
+      fixture.Emit(ValueOpcode::ImageWrite,
+                   {output, fixture.ImageAddress(), data, Value(true)},
+                   fixture.AddMemory(write, 0x130));
+    }
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
@@ -1545,8 +1566,10 @@ void TestGuardedDirectImageTable() {
   auto plan = make_plan(Guard::Nonzero);
   make_plan(Guard::SccNonZero);
   make_plan(Guard::Plain);
+  make_plan(Guard::SentinelMasked);
+  make_plan(Guard::SentinelMaskedWritten);
   for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass,
-                           Guard::ExecZero, Guard::VccZero}) {
+                           Guard::ExecZero, Guard::VccZero, Guard::SentinelUnmasked}) {
     CheckFatal([&] { make_plan(guard); }, "not a valid runtime value",
                "direct table accepted a selector without a dominating nonzero guard");
   }

@@ -1338,6 +1338,23 @@ private:
 		});
 	}
 
+	bool BoundedBitScanImageKey(Value key, const Inst& image) const {
+		const auto* scan = key.Resolve().TryInstruction();
+		if (scan == nullptr || scan->GetOpcode() != ValueOpcode::FindILsb32 ||
+		    scan->NumArgs() != 1u) return false;
+		if (NonzeroOnEntry(scan->Arg(0), image.Parent())) return true;
+		// An EXEC branch may only prove that some lanes have a valid scan.
+		// In that case every sampled value must be masked by the sentinel test.
+		for (const auto& use: scan->Uses()) {
+			const auto* test = use.user;
+			uint32_t sentinel = 0;
+			if (test->GetOpcode() == ValueOpcode::INotEqual32 && test->NumArgs() == 2u &&
+			    ImmediateU32(test->Arg(use.operand ^ 1u), sentinel) && sentinel == UINT32_MAX &&
+			    ImageSampleResultGuarded(image, Value(const_cast<Inst*>(test)))) return true;
+		}
+		return false;
+	}
+
 	struct U32Bounds {
 		uint32_t low       = 0;
 		uint32_t high      = 0;
@@ -2039,11 +2056,7 @@ private:
 		indirect.table_stride = table_stride;
 		bool known_key_count  = false;
 		if (table_source.dword_count == 2u) {
-			const auto* selector = key.Resolve().TryInstruction();
-			const bool  bitscan  = selector != nullptr &&
-			                       selector->GetOpcode() == ValueOpcode::FindILsb32 &&
-			                       selector->NumArgs() == 1u && !m_shader_writes &&
-			                       NonzeroOnEntry(selector->Arg(0), handle.Parent());
+			const bool bitscan = BoundedBitScanImageKey(key, handle);
 			if (bitscan) {
 				indirect.key_count = Value(32u);
 			} else {

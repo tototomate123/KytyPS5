@@ -1389,7 +1389,8 @@ void TestIndirectFormattedBuffer(uint32_t components) {
         "dynamic formatted XY(ZW) buffer was not routed through GPU address mapping");
 }
 
-void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, bool clamped = false) {
+void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, bool clamped = false,
+                                    uint32_t image_write = 0u) {
   Fixture fixture;
   const auto material = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
                                         fixture.UserData(2), fixture.UserData(3)});
@@ -1454,6 +1455,30 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
   fixture.Emit(ValueOpcode::StoreBufferU32,
                {output, Value(0u), Value(0u), Value(0u), component, Value(true)},
                fixture.AddMemory(store, 0x38));
+  if (image_write != 0u) {
+    std::array<Value, 8> write_words;
+    write_words.fill(Value(0u));
+    write_words[0] = Value(image_write == 3u ? 0x10u : image_write == 4u ? 0x20u : 0x40u);
+    write_words[1] = Value(static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u);
+    write_words[2] = Value(3u | (3u << 14u));
+    const auto tile = image_write == 2u || image_write == 4u
+                         ? Libs::Graphics::Prospero::TileMode::kStandard4KB
+                         : Libs::Graphics::Prospero::TileMode::kLinear;
+    write_words[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(tile) << 20u) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
+    if (image_write == 5u) write_words[6] = Value(1u << 21u);
+    const auto target = fixture.Image(write_words, 0x3c);
+    MemoryInfo write;
+    write.kind = ResourceKind::Image;
+    write.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+                                    {component, component, component, component});
+    fixture.Emit(ValueOpcode::ImageWrite,
+                  {target, fixture.ImageAddress(), data, Value(true)},
+                  fixture.AddMemory(write, 0x3c));
+  }
   fixture.PlanAndTrack();
   EliminateDeadCode(fixture.program.blocks);
   const auto &indirect = fixture.program.descriptor_sources[
@@ -1500,9 +1525,15 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false, b
                            .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  if (image_write >= 3u) {
+    Check(!MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
+                                snapshot, specialization),
+          "image write overlapping specialization data or using an unsupported layout was accepted");
+    return;
+  }
   Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime,
                              snapshot, specialization) &&
-            snapshot.images.size() == (nested || clamped ? 2u : 3u) &&
+            snapshot.images.size() == (nested || clamped ? 2u : 3u) + (image_write != 0u) &&
             snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] ==
                 (nested || clamped ? 2u : 3u),
         "masked scalar buffer image keys were not materialized");
@@ -4407,6 +4438,10 @@ int main() {
     Run("indirect formatted XYZW buffer", [] { TestIndirectFormattedBuffer(4u); });
     Run("masked scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(); });
     Run("clamped scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(false, false, true); });
+    Run("specialization with image writes", [] {
+      for (uint32_t image_write = 1u; image_write <= 5u; ++image_write)
+        TestMaskedScalarBufferImageKeys(false, false, false, image_write);
+    });
     Run("nested scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(true); });
     Run("mixed numeric indirect gather", [] { TestMaskedScalarBufferImageKeys(true, true); });
     Run("strided high-bits image table", [] { TestStridedHighBitsImageTable(); });

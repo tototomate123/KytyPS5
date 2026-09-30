@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -185,6 +186,67 @@ bool WrittenBuffersDisjoint(const ResourcePlan& program, const ResourceSnapshot&
 			    (address <= base ? base - address < bytes : address - base < size)) {
 				return false;
 			}
+		}
+	}
+	return true;
+}
+
+bool WrittenImageRange(const ImageResource& resource, const DescriptorValue& value,
+                       uint64_t& base, uint64_t& bytes) {
+	ShaderTextureResource texture;
+	std::copy_n(value.dwords.begin(), 8u, texture.fields);
+	base = texture.Base40();
+	bytes = 0u;
+	if (texture.IsNull()) return true;
+	// Keep compressed metadata and multisample writes conservative until their
+	// complete write ranges can be included in the alias proof.
+	if ((!resource.r128 && texture.MetaCompress()) ||
+	    (texture.Type() != Prospero::ImageType::kColor2D &&
+	     texture.Type() != Prospero::ImageType::kColor2DArray &&
+	     texture.Type() != Prospero::ImageType::kColor3D)) return false;
+	const bool volume = texture.Type() == Prospero::ImageType::kColor3D;
+	const uint32_t slices = texture.Type() == Prospero::ImageType::kColor2D ? 1u : texture.Depth() + 1u;
+	const uint32_t levels = (resource.r128 ? texture.LastLevel() : texture.MaxMip()) + 1u;
+	const uint32_t width = texture.Width5() + 1u;
+	const uint32_t height = texture.Height5() + 1u;
+	if (texture.TileMode() == Prospero::TileMode::kLinear) {
+		TileTextureElementLayout element;
+		if (!TileGetTextureElementLayout(texture.Format(), element) ||
+		    element.texel_width != 1u || element.texel_height != 1u) return false;
+		for (uint32_t level = 0; level < levels; ++level) {
+			const uint64_t mip_width = (width + (1u << level) - 1u) >> level;
+			const uint64_t mip_height = (height + (1u << level) - 1u) >> level;
+			const uint64_t row_bytes = (mip_width * element.bytes + 255u) & ~uint64_t{255u};
+			bytes += row_bytes * mip_height;
+		}
+		bytes = ((bytes + 255u) & ~uint64_t{255u}) * slices;
+	} else {
+		TileSurfaceLayout layout;
+		const TileSurfaceDescription description{
+		    texture.Format(), texture.TileMode(),
+		    volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+		    width, height, volume ? slices : 1u, levels, volume ? 1u : slices};
+		if (!TileGetTiledTextureLayout(description, layout)) return false;
+		bytes = layout.total_size;
+	}
+	return bytes != 0u && bytes <= UINT32_MAX && bytes - 1u <= AddressMask - base;
+}
+
+bool WrittenImagesDisjoint(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                           const ResourceSpecialization& specialization,
+                           std::span<const std::pair<uint64_t, uint64_t>> reads) {
+	for (uint32_t i = 0; i < snapshot.images.size(); ++i) {
+		const auto root = i < program.info.images.size() ? i : specialization.images[i].indirect_root;
+		if (root >= program.info.images.size()) return false;
+		const auto& resource = program.info.images[root];
+		if (!resource.written) continue;
+		uint64_t base = 0u, bytes = 0u;
+		if (!WrittenImageRange(resource, snapshot.images[i], base, bytes)) return false;
+		if (bytes == 0u) continue;
+		for (const auto [address, count]: reads) {
+			if (count == 0u) continue;
+			if (address > AddressMask || count - 1u > AddressMask - address ||
+			    (address <= base ? base - address < count : address - base < bytes)) return false;
 		}
 	}
 	return true;
@@ -1178,11 +1240,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		                   plan.clean_flat_slots);
 	}
 	if (protected_image) {
-		plan.resource_tracking_complete &=
-		    !program.has_address_writes &&
-		    !std::ranges::any_of(plan.info.images, &ImageResource::written);
+		plan.resource_tracking_complete &= !program.has_address_writes;
 		plan.capture_specialization_reads =
-		    std::ranges::any_of(plan.info.buffers, &BufferResource::written);
+		    std::ranges::any_of(plan.info.buffers, &BufferResource::written) ||
+		    std::ranges::any_of(plan.info.images, &ImageResource::written);
 	}
 	return plan;
 }
@@ -1303,6 +1364,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				snapshot.images[i].dwords.fill(0);
 			}
+			if (capture_reads && image.written && (active.empty() || active[image.source])) {
+				DescriptorValue strict;
+				if (!clean.EvaluateDescriptor(image.source, strict) || strict != snapshot.images[i])
+					return SpecializationFail(fmt::format(
+					    "shader=0x{:016x} written image {} is not stable", program.shader_hash, i));
+			}
 		}
 	}
 	snapshot.samplers.resize(program.info.samplers.size());
@@ -1315,6 +1382,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads))
 		return SpecializationFail(fmt::format(
 		    "shader=0x{:016x} written buffers overlap specialization reads",
+		    program.shader_hash));
+	if (capture_reads && !WrittenImagesDisjoint(program, snapshot, specialization, reads))
+		return SpecializationFail(fmt::format(
+		    "shader=0x{:016x} written images overlap specialization reads or have unsupported layouts",
 		    program.shader_hash));
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	if (!BuildResourceSpecialization(program, snapshot, specialization)) {

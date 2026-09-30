@@ -1416,8 +1416,14 @@ private:
 			return !local.IsEmpty() && BoundU32(local, guard, bounds, depth + 1u);
 		}
 		if (op == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
-			return ImpliesLoopGuard(guard, inst->Arg(0)) &&
-			       BoundU32(inst->Arg(1), guard, bounds, depth + 1u);
+			if (ImpliesLoopGuard(guard, inst->Arg(0)))
+				return BoundU32(inst->Arg(1), guard, bounds, depth + 1u);
+			U32Bounds left, right;
+			if (!BoundU32(inst->Arg(1), guard, left, depth + 1u) ||
+			    !BoundU32(inst->Arg(2), guard, right, depth + 1u)) return false;
+			bounds = {std::min(left.low, right.low), std::max(left.high, right.high),
+			          std::min(left.zero_bits, right.zero_bits)};
+			return true;
 		}
 		if (op == ValueOpcode::BitFieldUExtract && inst->NumArgs() == 3u) {
 			uint32_t start = 0;

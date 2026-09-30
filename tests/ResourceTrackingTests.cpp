@@ -1927,7 +1927,8 @@ void TestGuardedDirectImageTable() {
 }
 
 void TestExpandedImageTables(bool lane_selected = false, bool active_guard = true,
-                             bool equal_key = true, bool bit_field = false) {
+                             bool equal_key = true, bool bit_field = false,
+                             bool conditional_keys = false) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture;
   auto *entry = fixture.block;
@@ -1954,12 +1955,22 @@ void TestExpandedImageTables(bool lane_selected = false, bool active_guard = tru
   fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
   const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
   auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask}, 0, body);
-  const uint32_t candidates = lane_selected ? 16u : 32u;
+  const uint32_t candidates = lane_selected && !conditional_keys ? 16u : 32u;
   if (lane_selected) {
     const auto active = fixture.Emit(ValueOpcode::INotEqual32, {mask, Value(0u)}, 0, entry);
-    const auto masked = bit_field ? fixture.Emit(ValueOpcode::BitFieldUExtract,
+    auto masked = bit_field ? fixture.Emit(ValueOpcode::BitFieldUExtract,
         {mask, Value(8u), Value(4u)}, 0, entry) : fixture.Emit(ValueOpcode::BitwiseAnd32,
         {mask, Value(15u)}, 0, entry);
+    if (conditional_keys) {
+      const auto pick = fixture.Emit(ValueOpcode::INotEqual32,
+                                     {fixture.UserData(6), Value(0u)}, 0, entry);
+      const auto choices = fixture.Emit(ValueOpcode::SelectU32,
+                                        {pick, Value(31u), Value(8u)}, 0, entry);
+      const auto guarded_choices = fixture.Emit(ValueOpcode::SelectU32,
+          {active, choices, fixture.UserData(3)}, 0, entry);
+      masked = fixture.Emit(ValueOpcode::SelectU32,
+          {pick, Value(22u), guarded_choices}, 0, entry);
+    }
     const auto local = fixture.Emit(ValueOpcode::SelectU32,
                                      {active, masked, fixture.UserData(3)}, 0, entry);
     key = fixture.Emit(ValueOpcode::ReadLane, {local, Value(0u)}, 0, header);
@@ -4511,6 +4522,11 @@ int main() {
       TestExpandedImageTables(true, true, true, true);
       TestExpandedImageTables(true, false);
       TestExpandedImageTables(true, true, false);
+    });
+    Run("conditional lane image keys", [] {
+      TestExpandedImageTables(true, true, true, false, true);
+      TestExpandedImageTables(true, false, true, false, true);
+      TestExpandedImageTables(true, true, false, false, true);
     });
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);

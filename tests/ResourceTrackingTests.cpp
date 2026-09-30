@@ -1763,6 +1763,93 @@ void TestGuardedDirectImageTable() {
         "batched descriptor read crossed the 48-bit endpoint");
 }
 
+void TestExpandedImageTables() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *body = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  entry->AddBranch(body);
+  entry->AddBranch(exit);
+  body->AddBranch(exit);
+  const auto mask = fixture.UserData(2);
+  fixture.program.block_info[0].condition = fixture.Emit(
+      ValueOpcode::INotEqual32, {mask, Value(0u)});
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 1u, .false_block = 2u};
+  fixture.program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
+  fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask}, 0, body);
+  fixture.block = body;
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  for (uint32_t family = 0; family < 3u; ++family) {
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
+         Value(family * 1024u)});
+    std::array<Value, 8> words;
+    for (uint32_t i = 0; i < words.size(); ++i) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = i * 4u;
+      words[i] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x20));
+    }
+    const auto image = fixture.Image(words, 0x40);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture.ImageAddress()}, fixture.AddMemory(memory, 0x40));
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 3u, "expanded fixture lost guest table roots");
+  const auto plan = ExtractResourcePlan(fixture.program);
+  LinearTestMemory memory;
+  for (uint32_t i = 0; i < 96u; ++i) {
+    memory.words[i * 8u] = 0x100u + i;
+    memory.words[i * 8u + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[i * 8u + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 3> user_data{0x1000u, 0u, 1u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 96u && specialization.images.size() == 96u,
+        "indirect expansion inherited the guest image slot limit");
+  const auto first_specialization = specialization;
+  memory.words[95u * 8u] = 0x999u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            first_specialization == specialization && snapshot.images.back().dwords[0] == 0x999u,
+        "expanded image refresh changed shader layout or kept a stale descriptor");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  for (uint32_t root = 0; root < 3u; ++root) {
+    const auto &image = fixture.program.info.images[root];
+    Check(image.indirect_resources.size() == 32u && image.indirect_resources[0] == root,
+          "expanded table lost candidate ordinals");
+    const auto offset = image.indirect_mapping_offset;
+    Check(snapshot.flattened_srt[offset] == 32u &&
+              snapshot.flattened_srt[offset + 63u] == 31u &&
+              snapshot.flattened_srt[offset + 64u] == 31u,
+          "expanded table key mapping is inconsistent with its resources");
+  }
+  ShaderComputeInputInfo compute{};
+  compute.dispatch_thread_dimensions = true;
+  CollectShaderInfo(fixture.program, {.compute = &compute});
+  AllocateBindings(fixture.program);
+  const auto *binding = FindBinding(fixture.program.bindings,
+                                     *DescriptorBindingForImage(fixture.program.info.images[0]));
+  Check(binding && binding->resources.size() == 96u &&
+            fixture.program.info.sampled_pairs.size() == 96u,
+        "expanded image bindings or sampled pairs were truncated");
+}
+
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
@@ -4211,6 +4298,7 @@ int main() {
     Run("clamped high-bits image table", [] { TestStridedHighBitsImageTable(1u); });
     Run("reversed clamped image table", [] { TestStridedHighBitsImageTable(2u); });
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("expanded image tables", TestExpandedImageTables);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);

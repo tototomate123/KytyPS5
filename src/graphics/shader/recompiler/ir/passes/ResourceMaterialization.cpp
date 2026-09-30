@@ -22,6 +22,9 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
+// Guest resource slots and the candidates generated from those slots have
+// separate bounds. Several indirect tables can each contain dozens of images.
+constexpr uint32_t MaxSpecializedImages = 4096u;
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -531,7 +534,7 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 			                             snapshot.images.end(), candidate);
 			ordinal = static_cast<uint32_t>(found - snapshot.images.begin() - children_begin + 1u);
 			if (found == snapshot.images.end()) {
-				if (snapshot.images.size() >= ShaderInfo::MaxImages) {
+				if (snapshot.images.size() >= MaxSpecializedImages) {
 					return SpecializationFail(fmt::format(
 					    "shader=0x{:016x} indirect image {} exceeds image limit at key {} "
 					    "(keys={}, table base=0x{:x}, offset={}, stride={})",
@@ -572,8 +575,8 @@ struct SamplerPlan {
 
 struct ImageRemap {
 	explicit ImageRemap(const ResourceSpecialization& specialization)
-	    : source_count(static_cast<uint32_t>(specialization.images.size())) {
-		EXIT_IF(specialization.images.size() > indices.size());
+	    : indices(specialization.images.size()),
+	      source_count(static_cast<uint32_t>(specialization.images.size())) {
 		for (uint32_t index = 0; index < source_count; index++) {
 			indices[index] = specialization.images[index].fmask ? UINT32_MAX : count++;
 		}
@@ -599,7 +602,7 @@ struct ImageRemap {
 	}
 
 private:
-	std::array<uint32_t, ShaderInfo::MaxImages> indices;
+	std::vector<uint32_t> indices;
 	uint32_t                                    source_count;
 	uint32_t                                    count = 0;
 };

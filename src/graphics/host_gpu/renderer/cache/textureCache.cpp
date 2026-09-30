@@ -1968,18 +1968,19 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Pressure comes from the whole device; registration accounting belongs only
+	// to this cache and must survive driver budget/residency changes.
+	auto used_memory = m_graphics.CanReportMemoryUsage()
+	                       ? m_graphics.GetDeviceMemoryUsage() : m_total_used_memory;
+	if (used_memory < m_trigger_gc_memory) {
 		return;
 	}
-	const auto before = m_total_used_memory;
+	const auto before = used_memory;
 	size_t scanned = 0, freed = 0, retained_tiled = 0, failed_download = 0;
 	uint64_t freed_bytes = 0;
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		bool           pressured  = used_memory >= m_pressure_gc_memory;
+		bool           aggressive = allow_aggressive && used_memory >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
@@ -2026,20 +2027,21 @@ void TextureCache::RunGarbageCollector() {
 				}
 			}
 			freed_bytes += owner->AccountedSize();
+			used_memory -= std::min(used_memory, owner->AccountedSize());
 			++freed;
 			FreeImage(id);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			if (used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+			if (used_memory < m_pressure_gc_memory && pressured) {
 				deletions >>= 1;
 				pressured = false;
 			}
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
 	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed) &&

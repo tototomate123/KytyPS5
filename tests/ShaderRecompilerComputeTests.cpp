@@ -153,6 +153,14 @@ struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
+  static bool AccountingMatches(const BufferCache &cache) {
+    uint64_t registered = 0;
+    for (const auto &[address, id] : cache.m_buffers) {
+      registered += cache.m_slot_buffers[id].Size();
+    }
+    return registered == cache.m_total_used_memory;
+  }
+
   static void SetGarbageCollectionThresholds(BufferCache &cache,
                                              uint64_t trigger,
                                              uint64_t critical) {
@@ -254,6 +262,14 @@ struct TextureCacheTestAccess {
   static bool Contains(const TextureCache &cache, ImageId id) {
     const auto owner = cache.m_slot_images.try_get(id);
     return owner != nullptr && owner->registered;
+  }
+
+  static bool AccountingMatches(const TextureCache &cache) {
+    uint64_t registered = 0;
+    cache.m_slot_images.ForEach([&](ImageId, const Image &image) {
+      if (image.registered) registered += image.AccountedSize();
+    });
+    return registered == cache.m_total_used_memory;
   }
 
   static std::vector<ImageId> FindImages(TextureCache &cache, uint64_t address,
@@ -4246,6 +4262,9 @@ public:
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
+      Require(name, "buffer accounting survives driver pressure samples",
+              BufferCacheTestAccess::AccountingMatches(cache),
+              "GC replaced registered buffer bytes with device-wide usage");
       Require(name, "age before pressure",
               cache.IsRegionRegistered(base, allocation_size),
               "buffer was reclaimed without memory pressure");
@@ -7746,6 +7765,9 @@ public:
                   }) &&
                   !TextureCacheTestAccess::Contains(texture_cache, blocked_gc_images.back()),
               "GC discarded protected GPU data or failed to reach a later clean image");
+      Require(name, "texture accounting survives driver pressure samples",
+              TextureCacheTestAccess::AccountingMatches(texture_cache),
+              "GC replaced registered texture bytes with device-wide usage");
 
       constexpr uint64_t submit_readback_offset = 0x336000;
       constexpr uint32_t submit_readback_value = 0x13579bdfu;

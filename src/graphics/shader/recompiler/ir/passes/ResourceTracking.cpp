@@ -2214,6 +2214,13 @@ private:
 				if (ValidateRuntimeValue(m_program, loop_bound, RuntimeValueType::Integer)) {
 					indirect.selector_count = loop_bound;
 				}
+			} else if (!loop_bound.IsEmpty() &&
+			           ValidateRuntimeValue(m_program, loop_bound, RuntimeValueType::Integer)) {
+				// The signed loop comparison also bounds a runtime record count.
+				// Materialization checks the actual count and byte extent before
+				// probing, rejecting counts that could wrap the U32 stride.
+				indirect.selector_limit = INT32_MAX;
+				indirect.selector_count = loop_bound;
 			}
 			if (m_program.shader_hash == 0x82527951ad9793e5ull &&
 			    table_offset == 152u) {

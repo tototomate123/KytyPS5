@@ -295,7 +295,8 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
                                                       bool invalid_selector_leaf = false,
                                                       bool bounded_loop = false,
                                                       bool written_output = false,
-                                                      bool split_backedge = false) {
+                                                      bool split_backedge = false,
+                                                      bool runtime_loop_count = false) {
   auto fixture = std::make_unique<Fixture>();
   const auto root = fixture->Address(fixture->UserData(7), fixture->UserData(8), 0x11f0);
   const auto load_root_word = [&](uint32_t offset, uint32_t pc) {
@@ -337,8 +338,9 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
   selector_phi.AddPhiOperand(entry, Value(0u));
   selector_phi.AddPhiOperand(backedge, carried);
   if (bounded_loop) {
-    const auto bound = fixture->Emit(ValueOpcode::SMin32,
-                                     {fixture->UserData(11), Value(2u)}, 0, entry);
+    const auto count = fixture->UserData(11);
+    const auto bound = runtime_loop_count ? count : fixture->Emit(ValueOpcode::SMin32,
+                                     {count, Value(2u)}, 0, entry);
     const auto less = fixture->Emit(ValueOpcode::SLessThan32,
                                     {Value(&selector_phi), bound}, 0, loop);
     fixture->program.block_info[1].condition = fixture->Emit(
@@ -526,6 +528,31 @@ void TestInvariantIndirectImageMaterialization() {
   Check(MaterializeResources(bounded_plan, active_runtime, bounded_snapshot,
                              bounded_specialization),
         "zero material count did not produce a safe image fallback");
+  auto runtime_bounded = MakeAddressBackedImageFixture(0u, true, false, true,
+                                                       false, false, true);
+  runtime_bounded->PlanAndTrack();
+  const auto &runtime_indirect = runtime_bounded->program.descriptor_sources[
+      runtime_bounded->program.info.images[0].source].indirect_image;
+  Check(runtime_indirect && runtime_indirect->selector_limit == INT32_MAX &&
+            !runtime_indirect->selector_count.IsEmpty(),
+        "signed runtime loop count did not bound the material selector");
+  const auto runtime_plan = ExtractResourcePlan(runtime_bounded->program);
+  active_user_data[11] = 1u;
+  Check(MaterializeResources(runtime_plan, active_runtime, bounded_snapshot,
+                             bounded_specialization),
+        "runtime loop count read an inactive material record as an image key");
+  for (const uint32_t count : {0u, UINT32_MAX, 0x80000000u}) {
+    active_user_data[11] = count;
+    Check(MaterializeResources(runtime_plan, active_runtime, bounded_snapshot,
+                               bounded_specialization),
+          "nonpositive signed runtime count did not produce a safe fallback");
+  }
+  for (const uint32_t count : {65537u, static_cast<uint32_t>(INT32_MAX)}) {
+    active_user_data[11] = count;
+    Check(!MaterializeResources(runtime_plan, active_runtime, bounded_snapshot,
+                                bounded_specialization),
+          "excessive runtime record count was accepted");
+  }
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
   Check(fixture->program.info.images[0].simple_2d_3d_sampling,

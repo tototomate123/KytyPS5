@@ -1062,7 +1062,7 @@ private:
 		        IsUniformLoopIndex(selector));
 	}
 
-	bool MatchBufferRecordKey(Value key, DescriptorSource& material_source,
+	bool MatchBufferRecordKey(Value key, const Inst& image, DescriptorSource& material_source,
 	                          DescriptorSource::IndirectImage& indirect, bool diagnostic = false) {
 		const auto reject = [&](const char* reason) {
 			if (diagnostic) std::fprintf(stderr, "HFW record matcher: %s\n", reason);
@@ -1081,28 +1081,37 @@ private:
 		if (select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32 &&
 		    select->NumArgs() == 3u) {
 			uint32_t fallback = UINT32_MAX;
-			if (!ImmediateU32(select->Arg(2), fallback) || fallback != 0u)
-				return reject("select has nonzero fallback");
+			if (!ImmediateU32(select->Arg(2), fallback) || fallback != 0u) {
+				// A waterfall can retain an older key in inactive lanes. Its positive
+				// branch must prove an active local key equals this shared key, and
+				// that the local key comes from the enabled buffer load.
+				const auto witness = PositiveLaneWitness(image.Parent());
+				if (witness.IsEmpty() ||
+				    !EquivalentValue(m_program, EqualLocalKey(witness, key), selected) ||
+				    !ImpliesLoopGuard(witness, select->Arg(0)))
+					return reject("select fallback is not excluded by active key equality");
+			}
 			guard    = select->Arg(0).Resolve();
 			selected = select->Arg(1).Resolve();
 		}
 		const auto* component = selected.TryInstruction();
-		if (component == nullptr || component->NumArgs() != 2u) {
-			return reject("selected value is not an extract");
-		}
-		const auto width = component->GetOpcode() == ValueOpcode::CompositeExtractU32x2   ? 2u
+		if (component == nullptr) return reject("selected value is not a buffer load or extract");
+		const auto width = component->GetOpcode() == ValueOpcode::LoadBufferU32           ? 1u
+		                   : component->GetOpcode() == ValueOpcode::CompositeExtractU32x2 ? 2u
 		                   : component->GetOpcode() == ValueOpcode::CompositeExtractU32x3 ? 3u
 		                   : component->GetOpcode() == ValueOpcode::CompositeExtractU32x4 ? 4u
 		                                                                                  : 0u;
-		uint32_t   component_index;
-		if (width == 0u || !ImmediateU32(component->Arg(1), component_index) ||
-		    component_index >= width) {
+		uint32_t component_index = 0u;
+		if (width == 0u || (width != 1u &&
+		    (component->NumArgs() != 2u || !ImmediateU32(component->Arg(1), component_index) ||
+		     component_index >= width))) {
 			return reject("extract width or index invalid");
 		}
-		const auto* load     = component->Arg(0).Resolve().TryInstruction();
-		const auto  expected = width == 2u   ? ValueOpcode::LoadBufferU32x2
-		                       : width == 3u ? ValueOpcode::LoadBufferU32x3
-		                                     : ValueOpcode::LoadBufferU32x4;
+		const auto* load = width == 1u ? component : component->Arg(0).Resolve().TryInstruction();
+		const auto expected = width == 1u   ? ValueOpcode::LoadBufferU32
+		                      : width == 2u ? ValueOpcode::LoadBufferU32x2
+		                      : width == 3u ? ValueOpcode::LoadBufferU32x3
+		                                    : ValueOpcode::LoadBufferU32x4;
 		if (load == nullptr || load->GetOpcode() != expected || load->NumArgs() != 5u) {
 			return reject("extract source is not matching vector buffer load");
 		}
@@ -1124,9 +1133,10 @@ private:
 		}
 		const auto& memory = m_program.memory_info[memory_index];
 		if (memory.kind != ResourceKind::Buffer || memory.formatted ||
-		    !memory.SupportsIndirectBufferLoad(expected) ||
+		    (width == 1u ? (memory.typed || memory.data_bits != 32u)
+		                 : !memory.SupportsIndirectBufferLoad(expected)) ||
 		    memory.data_dwords != width || memory.offset > UINT32_MAX - component_index * 4u) {
-			return reject("buffer load metadata not a raw DWORD vector");
+			return reject("buffer load metadata not raw DWORDs");
 		}
 		const auto* handle = load->Arg(0).Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
@@ -2172,7 +2182,7 @@ private:
 		if (known_key_count) {
 			// The key range was proven by the bit scan, loop bound, or guarded mask.
 		} else if (MatchMaskedConstBufferKey(key, material_source, indirect) ||
-		           MatchBufferRecordKey(key, material_source, indirect,
+		           MatchBufferRecordKey(key, handle, material_source, indirect,
 		                                m_program.shader_hash == 0xcab22f5d729ab8c6ull &&
 		                                    table_offset == 1760u) ||
 		           (table_source.dword_count == 2u &&

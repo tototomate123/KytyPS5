@@ -1215,27 +1215,51 @@ void TestLaneSelectedAddressImageKeys() {
   }
 }
 
-std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted, bool guarded = false) {
+std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted, bool guarded = false,
+                                                    bool scalar = false, bool first_lane = false,
+                                                    uint32_t preserved_fallback = 0u) {
   auto fixture = std::make_unique<Fixture>();
   const auto material = fixture->Buffer({fixture->UserData(0), fixture->UserData(1),
                                          fixture->UserData(2), fixture->UserData(3)});
   MemoryInfo record;
   record.kind = ResourceKind::Buffer;
   record.data_bits = 32u;
-  record.data_dwords = 3u;
+  record.data_dwords = scalar ? 1u : 3u;
+  record.offset = scalar ? 8u : 0u;
   record.formatted = formatted;
   const auto enabled = guarded ? fixture->Emit(
       ValueOpcode::INotEqual32, {fixture->UserData(6), Value(0u)}) : Value(true);
   const auto loaded = fixture->Emit(
-      ValueOpcode::LoadBufferU32x3,
+      scalar ? ValueOpcode::LoadBufferU32 : ValueOpcode::LoadBufferU32x3,
       {material, fixture->UserData(6), Value(0u), Value(0u), enabled},
       fixture->AddMemory(record, 0x60));
-  const auto component = fixture->Emit(ValueOpcode::CompositeExtractU32x3,
-                                       {loaded, Value(2u)});
+  const auto component = scalar ? loaded : fixture->Emit(ValueOpcode::CompositeExtractU32x3,
+                                                         {loaded, Value(2u)});
   const auto selected = guarded ? fixture->Emit(
-      ValueOpcode::SelectU32, {enabled, component, Value(0u)}) : component;
-  const auto key = fixture->Emit(ValueOpcode::ReadLane,
-                                 {selected, Value(0u)});
+      ValueOpcode::SelectU32,
+      {enabled, component, preserved_fallback ? fixture->UserData(11) : Value(0u)}) : component;
+  const auto key = fixture->Emit(first_lane ? ValueOpcode::ReadFirstLane : ValueOpcode::ReadLane,
+                                 {selected, first_lane ? enabled : Value(0u)});
+  if (preserved_fallback) {
+    namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+    auto *entry = fixture->block;
+    auto *body = fixture->AddBlock();
+    auto *exit = fixture->AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(exit);
+    body->AddBranch(exit);
+    const auto equal = fixture->Emit(ValueOpcode::IEqual32,
+        {key, preserved_fallback == 3u ? fixture->UserData(12) : selected});
+    fixture->program.block_info[0].condition = preserved_fallback == 2u ? equal :
+        fixture->Emit(ValueOpcode::LogicalAnd, {enabled, equal});
+    fixture->program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 1u, .false_block = 2u};
+    fixture->program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
+    fixture->program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+    fixture->block = body;
+  }
   const auto table = fixture->Address(fixture->UserData(4), fixture->UserData(5));
   const auto offset = fixture->Emit(ValueOpcode::ShiftLeftLogical32,
                                    {key, Value(5u)});
@@ -1278,6 +1302,21 @@ void TestBufferRecordImageKey() {
   CheckFatal([&] { formatted->PlanAndTrack(); },
              "not a valid runtime value",
              "formatted vector load was accepted as a raw record key");
+  auto formatted_scalar = MakeBufferRecordImageFixture(true, true, true, true);
+  CheckFatal([&] { formatted_scalar->PlanAndTrack(); },
+             "not a valid runtime value",
+             "formatted scalar load was accepted as a raw record key");
+  for (uint32_t proof : {2u, 3u}) {
+    auto unproven = MakeBufferRecordImageFixture(false, true, true, false, proof);
+    CheckFatal([&] { unproven->PlanAndTrack(); }, "not a valid runtime value",
+               "preserved scalar key was accepted without an active equality proof");
+  }
+  auto mismatched_enable = MakeBufferRecordImageFixture(false, true, true);
+  for (auto &inst : mismatched_enable->block->Instructions()) {
+    if (inst.GetOpcode() == ValueOpcode::LoadBufferU32) inst.SetArg(4, Value(false));
+  }
+  CheckFatal([&] { mismatched_enable->PlanAndTrack(); }, "not a valid runtime value",
+             "scalar key with a mismatched load enable was accepted");
 
   auto fixture = MakeBufferRecordImageFixture(false);
   fixture->PlanAndTrack();
@@ -1335,6 +1374,23 @@ void TestBufferRecordImageKey() {
   ApplyResourceSpecialization(fixture->program, specialization);
   Check(fixture->program.info.images[0].indirect_resources.size() == 4u,
         "dimension query specialization discarded its runtime candidates");
+  for (bool first_lane : {false, true}) {
+    for (uint32_t preserved_fallback : {0u, 1u}) {
+      auto scalar = MakeBufferRecordImageFixture(false, true, true, first_lane, preserved_fallback);
+      scalar->PlanAndTrack();
+      const auto &scalar_indirect = scalar->program.descriptor_sources[
+          scalar->program.info.images[0].source].indirect_image;
+      Check(scalar_indirect && scalar_indirect->record_key &&
+                scalar_indirect->selector_offset == 8u,
+            "guarded scalar record key was not recognized");
+      auto scalar_plan = ExtractResourcePlan(scalar->program);
+      ResourceSnapshot scalar_snapshot;
+      ResourceSpecialization scalar_specialization;
+      Check(MaterializeResources(scalar_plan, runtime, scalar_snapshot, scalar_specialization) &&
+                scalar_snapshot.images.size() == 4u,
+            "guarded scalar record keys were not materialized");
+    }
+  }
   memory.words[5] = 0x43800000u; // Inactive record contains float bits, not an image key.
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "unmapped descriptor from an inactive record rejected the shader");

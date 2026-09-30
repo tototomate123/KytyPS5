@@ -1070,7 +1070,9 @@ void TestBoundedAddressImageKeys() {
 
 void TestLaneSelectedAddressImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  for (uint32_t variant = 0; variant < 4u; ++variant) {
+  for (uint32_t scenario = 0; scenario < 8u; ++scenario) {
+    const uint32_t variant = scenario % 4u;
+    const bool first_lane = scenario >= 4u;
     Fixture fixture(Libs::Graphics::ShaderType::Pixel);
     auto *entry = fixture.block;
     auto *body = fixture.AddBlock();
@@ -1086,12 +1088,14 @@ void TestLaneSelectedAddressImageKeys() {
     fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
     const auto active = fixture.Emit(ValueOpcode::INotEqual32,
                                      {fixture.UserData(3), Value(0u)});
+    const auto varying = first_lane ? fixture.Emit(
+        ValueOpcode::GetAttribute, {Value(0u), Value(0u)}) : fixture.UserData(2);
     const auto clamp = fixture.Emit(ValueOpcode::UMin32,
-                                    {fixture.UserData(2), Value(7u)});
+                                    {varying, Value(7u)});
     const auto local = fixture.Emit(ValueOpcode::SelectU32,
-                                    {active, clamp, fixture.UserData(2)});
-    const auto lane = fixture.Emit(ValueOpcode::ReadLane,
-                                   {local, fixture.UserData(4)});
+                                    {active, clamp, varying});
+    const auto lane = fixture.Emit(first_lane ? ValueOpcode::ReadFirstLane : ValueOpcode::ReadLane,
+                                   {local, first_lane ? active : fixture.UserData(4)});
     const auto equal = fixture.Emit(ValueOpcode::IEqual32,
         {lane, variant == 1u ? fixture.UserData(5) : local});
     const auto guard = variant == 2u ? equal : fixture.Emit(

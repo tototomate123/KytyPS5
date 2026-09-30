@@ -1393,7 +1393,8 @@ private:
 		const auto* inst = value.Resolve().TryInstruction();
 		if (inst == nullptr) return false;
 		const auto op = inst->GetOpcode();
-		if (op == ValueOpcode::ReadLane && inst->NumArgs() == 2u) {
+		if ((op == ValueOpcode::ReadLane || op == ValueOpcode::ReadFirstLane) &&
+		    inst->NumArgs() == 2u) {
 			// A waterfall loop compares the selected lane's key with each local
 			// key. Its active-lane witness bounds the uniform key, even if the
 			// selected lane itself was inactive before the comparison.

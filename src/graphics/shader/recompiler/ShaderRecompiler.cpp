@@ -21,7 +21,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <map>
 #include <span>
 #include <utility>
@@ -631,7 +634,26 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
+	if (options.stage == ShaderType::Compute &&
+	    (options.shader_hash == 0xcab22f5d729ab8c6ull ||
+	     options.shader_hash == 0x82527951ad9793e5ull ||
+	     options.shader_hash == 0xdb985300f9789d7bull ||
+	     options.shader_hash == 0x7f444d45d935a544ull ||
+	     options.shader_hash == 0x2bee40a546f12760ull)) {
+		const auto path = std::filesystem::temp_directory_path() /
+		                  fmt::format("kyty-hfw-{:016x}-ir.txt", options.shader_hash);
+		std::ofstream dump(path);
+		if (dump) {
+			dump << "DECODED:\n" << Decoder::ProgramToString(decoded)
+			     << "\n" << MakeIrDump(CFG::GraphToString(cfg), ir);
+			std::fprintf(stderr, "HFW shader diagnostic written to %s\n",
+			             path.string().c_str());
+		}
+	}
 	IR::TrackResources(ir, decoded, native_cfg);
+	if (options.stage == ShaderType::Compute && options.shader_hash == 0xcab22f5d729ab8c6ull) {
+		std::fprintf(stderr, "HFW shader diagnostic: resource tracking complete\n");
+	}
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);

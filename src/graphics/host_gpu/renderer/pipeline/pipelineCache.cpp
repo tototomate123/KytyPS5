@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/loadDiagnostics.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -172,9 +173,11 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	PipelineKeyHash::Mix(hash, key.rendering.color_count);
 	for (uint32_t i = 0; i < key.rendering.color_count; i++) {
 		PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.color_formats[i]));
+		PipelineKeyHash::Mix(hash, key.rendering.color_samples[i]);
 	}
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.depth_format));
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.stencil_format));
+	PipelineKeyHash::Mix(hash, key.rendering.depth_samples);
 	for (const auto id: key.vertex_shader_ids) {
 		PipelineKeyHash::Mix(hash, id);
 	}
@@ -246,20 +249,37 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
+		if (options.shader_hash == 0xcab22f5d729ab8c6ull) {
+			std::fprintf(stderr, "HFW shader diagnostic: compiling SPIR-V\n");
+		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		if (options.shader_hash == 0xcab22f5d729ab8c6ull) {
+			std::fprintf(stderr, "HFW shader diagnostic: validating SPIR-V\n");
+		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (options.shader_hash == 0xcab22f5d729ab8c6ull) {
+			std::fprintf(stderr, "HFW shader diagnostic: creating Vulkan module (%zu SPIR-V words)\n",
+			             result.spirv.size());
+		}
 
 		const auto module = CompileSPV(result.spirv, device);
+		if (options.shader_hash == 0xcab22f5d729ab8c6ull) {
+			std::fprintf(stderr, "HFW shader diagnostic: Vulkan module created\n");
+			LoadDiagnostics::hfw_gpu_trace_enabled.store(true, std::memory_order_relaxed);
+		}
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+		}
+		if (options.shader_hash == 0xcab22f5d729ab8c6ull) {
+			std::fprintf(stderr, "HFW shader diagnostic: assembling permutation\n");
 		}
 		return {
 		    .specialization = std::move(specialization),
@@ -297,9 +317,12 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				EXIT("shader resource materialization failed: hash=0x%016" PRIx64
+				     " stage=%u\n", params.hash, static_cast<uint32_t>(stage));
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -372,6 +395,9 @@ struct PipelineCache::ProgramCache {
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		if (options.shader_hash == 0xcab22f5d729ab8c6ull) {
+			std::fprintf(stderr, "HFW shader diagnostic: permutation stored\n");
+		}
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -389,6 +415,7 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::Local)],
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+		LoadDiagnostics::ShaderCompiled();
 		return permutation.handle;
 	}
 
@@ -715,6 +742,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
+		rendering.color_samples[slot] = colors[i].desc.info.samples;
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;
 		} else if (attachment_samples != colors[i].desc.info.samples) {
@@ -752,6 +780,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const bool with_depth =
 	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
 	if (with_depth) {
+		rendering.depth_samples = depth.desc.info.samples;
 		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
 		                               ? depth.desc.view_info.format
@@ -762,8 +791,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
 		} else if (attachment_samples != depth.desc.info.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
+			if (!m_graphics.mixed_attachment_samples_enabled ||
+			    depth.desc.info.samples < attachment_samples ||
+			    depth.desc.info.samples % attachment_samples != 0u) {
+				EXIT("mixed color/depth sample counts are unsupported: %u and %u\n",
+				     attachment_samples, depth.desc.info.samples);
+			}
+			attachment_samples = depth.desc.info.samples;
 		}
 	}
 	if (color_count == 0 && !with_depth) {
@@ -873,7 +907,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	if (input_info.stage.program->shader_hash == 0xcab22f5d729ab8c6ull) {
+		std::fprintf(stderr, "HFW shader diagnostic: creating compute pipeline\n");
+	}
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	if (input_info.stage.program->shader_hash == 0xcab22f5d729ab8c6ull) {
+		std::fprintf(stderr, "HFW shader diagnostic: compute pipeline created\n");
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

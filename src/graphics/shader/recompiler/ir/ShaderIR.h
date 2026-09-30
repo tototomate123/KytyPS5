@@ -71,9 +71,16 @@ struct MemoryInfo {
 	bool                    planning_only            = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		return !formatted && !typed && data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
-		        opcode == ValueOpcode::LoadBufferU32x4);
+		if (typed || data_bits != 32u) return false;
+		if (formatted) {
+			// A dynamic buffer descriptor can be read directly when each XYZ
+			// component occupies one complete DWORD. The emitter checks the
+			// runtime format and channel order before loading.
+			return opcode == ValueOpcode::LoadBufferU32x3 && data_dwords == 3u;
+		}
+		return opcode == ValueOpcode::LoadBufferU32x2 ||
+		       opcode == ValueOpcode::LoadBufferU32x3 ||
+		       opcode == ValueOpcode::LoadBufferU32x4;
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -472,6 +479,7 @@ struct DescriptorSource {
 		uint32_t selector_limit  = 0;
 		uint32_t table_offset    = 0;
 		Value    key_count;
+		Value    selector_count;
 		Value    selector_mask;
 		bool     record_key        = false;
 		bool     address_key       = false;

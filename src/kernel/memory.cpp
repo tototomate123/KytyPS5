@@ -696,6 +696,14 @@ public:
 	           AllocationKind kind = AllocationKind::Direct);
 	bool ReserveAutomatic(uint64_t size, PhysicalRanges* ranges);
 	void RestoreAutomatic(const PhysicalRanges& ranges);
+	uint64_t AutomaticFreeBytes() {
+		Common::LockGuard lock(m_mutex);
+		uint64_t bytes = 0;
+		for (const auto& [start, size]: m_automatic_free) {
+			bytes += size;
+		}
+		return bytes;
+	}
 	bool Available(uint64_t search_start, uint64_t search_end, size_t alignment,
 	               uint64_t* phys_addr_out, uint64_t* size_out);
 	bool Release(uint64_t start, size_t len, uint64_t* vaddr, uint64_t* size,
@@ -2624,6 +2632,11 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	return UnmapMemoryRange(vaddr, len);
 }
 
+bool DirectMemoryHasMappings(uint64_t physical_start, uint64_t size) {
+	std::lock_guard<std::recursive_mutex> lock(g_memory_operation_mutex);
+	return !g_physical_memory->FindMappings(physical_start, size).empty();
+}
+
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 
@@ -3183,6 +3196,12 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
 	}
 	return OK;
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+uint64_t TestAutomaticFreeBytes() {
+	return g_physical_memory->AutomaticFreeBytes();
+}
+#endif
 
 int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags,
                                              int64_t direct_memory_start, size_t alignment,

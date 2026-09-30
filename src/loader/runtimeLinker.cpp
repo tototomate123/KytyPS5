@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/loadDiagnostics.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -199,6 +200,10 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
+	if (LoadDiagnostics::Enabled() && record_id < g_stubbed_imports.size() &&
+	    g_stubbed_imports[record_id].name.rfind("i3STzxuwPx0[Rudp_v1]", 0) == 0) {
+		LoadDiagnostics::RudpStatusCalled();
+	}
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];

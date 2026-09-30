@@ -7,6 +7,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -262,6 +263,11 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 	}
 	auto& keys = program.material_keys;
 	keys.clear();
+	uint32_t runtime_selector_count = 0;
+	const bool zero_selector_count =
+	    indirect.selector_limit != 0u && !indirect.selector_count.IsEmpty() &&
+	    clean.Evaluate(indirect.selector_count, runtime_selector_count) &&
+	    std::bit_cast<int32_t>(runtime_selector_count) <= 0;
 	if (indirect.material_source == UINT32_MAX) {
 		uint32_t   key_count = 0;
 		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
@@ -318,6 +324,31 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 		}
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+	} else if (zero_selector_count) {
+		// The loop guard proves that no image access executes. Keep a typed table
+		// descriptor and a null fallback so the indirect shader can still compile.
+		uint32_t exemplar_key = UINT32_MAX;
+		for (uint32_t key = 0; key < ShaderInfo::MaxImages; ++key) {
+			DescriptorValue candidate;
+			candidate.dword_count = 8u;
+			const auto offset = static_cast<uint64_t>(indirect.table_offset) +
+			                    static_cast<uint64_t>(key) * 32u;
+			if (offset > UINT32_MAX ||
+			    !ReadScalarTable(table_base, table_size, offset, runtime, candidate.dwords)) {
+				continue;
+			}
+			if (!NullImageDescriptor(candidate) &&
+			    ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
+				exemplar_key = key;
+				break;
+			}
+		}
+		if (exemplar_key == UINT32_MAX) {
+			return SpecializationFail(fmt::format(
+			    "shader=0x{:016x} indirect image {} has zero active records and no typed fallback",
+			    program.shader_hash, image_index));
+		}
+		keys = {exemplar_key, UINT32_MAX};
 	} else {
 		ShaderBufferResource material;
 		if (!DecodeBufferDescriptor(material_value, material) ||
@@ -355,7 +386,24 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		} else if (indirect.selector_limit != 0u) {
 			// The loop exits before this positive signed cap, so its U32 index cannot wrap.
-			const auto count = indirect.selector_limit;
+			uint32_t count = indirect.selector_limit;
+			if (!indirect.selector_count.IsEmpty()) {
+				uint32_t runtime_count = 0;
+				const bool evaluated = clean.Evaluate(indirect.selector_count, runtime_count);
+				if (evaluated) {
+					count = std::bit_cast<int32_t>(runtime_count) > 0
+					            ? std::min(runtime_count, indirect.selector_limit)
+					            : 0u;
+				}
+				if (program.shader_hash == 0x82527951ad9793e5ull && image_index == 3u) {
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					std::fprintf(stderr,
+					             "HFW selector count: evaluated=%u runtime=%u cap=%u probe=%u\n",
+					             evaluated, runtime_count, indirect.selector_limit, count);
+				}
+				}
+			}
 			if (count > MaxIndirectImageProbes ||
 			    static_cast<uint64_t>(indirect.selector_offset) +
 			            static_cast<uint64_t>(count - 1u) * indirect.selector_stride >
@@ -413,11 +461,23 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 		DescriptorValue candidate;
 		candidate.dword_count   = 8u;
 		const auto table_offset = (key << 5u) + indirect.table_offset;
-		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
+		const bool read_ok = (zero_selector_count && key == UINT32_MAX) ||
+		                     ReadScalarTable(table_base, table_size, table_offset, runtime,
+		                                     candidate.dwords);
+		if (!read_ok && !indirect.record_key) {
 			return SpecializationFail(fmt::format(
-			    "shader=0x{:016x} indirect image {} candidate key {} read failed at offset {}",
-			    program.shader_hash, image_index, key, table_offset));
+			    "shader=0x{:016x} indirect image {} candidate key {} read failed at offset {} "
+			    "(table base 0x{:x}, size {}, material source {}, address key {}, "
+			    "record key {}, selector offset {}, stride {}, limit {}, key scale {}, bias {})",
+			    program.shader_hash, image_index, key, table_offset, table_base, table_size,
+			    indirect.material_source, indirect.address_key, indirect.record_key,
+			    indirect.selector_offset, indirect.selector_stride, indirect.selector_limit,
+			    indirect.key_scale, indirect.key_bias));
 		}
+		// A record-key probe includes every address reachable through U32 index
+		// arithmetic, including inactive records. An unmapped image descriptor
+		// in that superset is represented by the null candidate.
+		if (!read_ok) candidate.dwords.fill(0u);
 		if (NullImageDescriptor(candidate) ||
 		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
 			candidate.dwords.fill(0);
@@ -1015,6 +1075,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		target.indirect_image = source.indirect_image;
 		if (target.indirect_image.has_value()) {
 			target.indirect_image->key_count     = Clone(target.indirect_image->key_count);
+			target.indirect_image->selector_count = Clone(target.indirect_image->selector_count);
 			target.indirect_image->selector_mask = Clone(target.indirect_image->selector_mask);
 		}
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
@@ -1046,6 +1107,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		                   source->indirect_image->address_key;
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->material_source),
 		                   plan.clean_flat_slots, source->indirect_image->selector_mask);
+		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots,
+		                   source->indirect_image->selector_count);
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
 	}
@@ -1063,7 +1126,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
-		return false;
+		return SpecializationFail(fmt::format(
+		    "shader=0x{:016x} resource plan unavailable (complete={} memory={})",
+		    program.shader_hash, program.resource_tracking_complete,
+		    runtime.read_specialization_memory != nullptr));
 	}
 	const bool  capture_reads = program.capture_specialization_reads;
 	auto&       reads         = program.specialization_reads;
@@ -1079,7 +1145,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtWalker  walker(program, observed, program.clean_flat_slots, &clean);
 	const auto active = clean.FindActiveSources();
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
+		return SpecializationFail(fmt::format(
+		    "shader=0x{:016x} flat SRT refresh failed", program.shader_hash));
 	}
 	snapshot.uniform_fill         = {};
 	const auto&             fill  = program.uniform_fill;
@@ -1107,7 +1174,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	snapshot.buffers.resize(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
 		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
-			return false;
+			return SpecializationFail(fmt::format(
+			    "shader=0x{:016x} buffer {} evaluation failed", program.shader_hash, i));
 		}
 	}
 	if (capture_reads) {
@@ -1116,7 +1184,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (!buffer.written || (!active.empty() && !active[buffer.source])) continue;
 			DescriptorValue strict;
 			if (!clean.EvaluateDescriptor(buffer.source, strict) || strict != snapshot.buffers[i])
-				return false;
+				return SpecializationFail(fmt::format(
+				    "shader=0x{:016x} written buffer {} is not stable", program.shader_hash, i));
 		}
 	}
 	snapshot.images.resize(program.info.images.size());
@@ -1136,7 +1205,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
-			return false;
+			return SpecializationFail(fmt::format(
+			    "shader=0x{:016x} image {} source is missing", program.shader_hash, i));
 		}
 		if (source->indirect_image.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
@@ -1146,7 +1216,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto&     indirect = *source->indirect_image;
 			DescriptorValue material;
 			DescriptorValue table;
-			if ((indirect.material_source != UINT32_MAX &&
+			uint32_t        selector_count = 0;
+			const bool zero_selector_count =
+			    indirect.selector_limit != 0u && !indirect.selector_count.IsEmpty() &&
+			    clean.Evaluate(indirect.selector_count, selector_count) &&
+			    std::bit_cast<int32_t>(selector_count) <= 0;
+			if ((indirect.material_source != UINT32_MAX && !zero_selector_count &&
 			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
 			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
 			    !MaterializeIndirectImage(program, indirect, material, table, i, observed, clean,
@@ -1157,7 +1232,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i])) {
-				return false;
+				return SpecializationFail(fmt::format(
+				    "shader=0x{:016x} image {} evaluation failed", program.shader_hash, i));
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				snapshot.images[i].dwords.fill(0);
@@ -1167,12 +1243,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
-			return false;
+			return SpecializationFail(fmt::format(
+			    "shader=0x{:016x} sampler {} evaluation failed", program.shader_hash, i));
 		}
 	}
-	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
+	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads))
+		return SpecializationFail(fmt::format(
+		    "shader=0x{:016x} written buffers overlap specialization reads",
+		    program.shader_hash));
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	if (!BuildResourceSpecialization(program, snapshot, specialization)) {
+		return SpecializationFail(fmt::format(
+		    "shader=0x{:016x} resource specialization build failed", program.shader_hash));
+	}
+	return true;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>
@@ -806,11 +807,13 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride ||
-				    a.selector_offset != b.selector_offset || a.table_offset != b.table_offset ||
+				    a.selector_offset != b.selector_offset || a.selector_limit != b.selector_limit ||
+				    a.table_offset != b.table_offset ||
 				    a.record_key != b.record_key || a.address_key != b.address_key ||
 				    a.address_key_count != b.address_key_count || a.key_scale != b.key_scale ||
 				    a.key_bias != b.key_bias ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
+				    !EquivalentValue(m_program, a.selector_count, b.selector_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
 				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask)))
@@ -1069,7 +1072,8 @@ private:
 			return false;
 		}
 		const auto& memory = m_program.memory_info[memory_index];
-		if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(expected) ||
+		if (memory.kind != ResourceKind::Buffer || memory.formatted ||
+		    !memory.SupportsIndirectBufferLoad(expected) ||
 		    memory.data_dwords != width || memory.offset > UINT32_MAX - component_index * 4u) {
 			return false;
 		}
@@ -1748,8 +1752,14 @@ private:
 			const auto  zero = phi->Arg(initial).Resolve();
 			const auto* step = phi->Arg(initial ^ 1u).Resolve().TryInstruction();
 			if (!zero.IsImmediate() || zero.GetType() != Type::U32 || zero.U32() != 0u ||
-			    step == nullptr || step->GetOpcode() != ValueOpcode::IAdd32 ||
-			    step->Parent() != phi->PhiBlock(initial ^ 1u))
+			    step == nullptr || step->GetOpcode() != ValueOpcode::IAdd32)
+				continue;
+			const auto* incoming = phi->PhiBlock(initial ^ 1u);
+			if (step->Parent() != incoming &&
+			    !(incoming->empty() && incoming->ImmPredecessors().size() == 1u &&
+			      incoming->ImmPredecessors()[0] == step->Parent() &&
+			      incoming->ImmSuccessors().size() == 1u &&
+			      incoming->ImmSuccessors()[0] == phi->Parent()))
 				continue;
 			uint32_t increment = 0;
 			if ((step->Arg(0).Resolve() == key && ImmediateU32(step->Arg(1), increment) &&
@@ -1867,6 +1877,12 @@ private:
 			if (indirect.key_count.IsEmpty()) {
 				MatchUniformizedMaterialKey(key, handle, indirect, material_source);
 			}
+			// HFW's lane-selected material IDs come from several buffer loads. Probe a
+			// bounded image-table prefix while that key flow is being modeled.
+			if (indirect.key_count.IsEmpty() && m_program.shader_hash == 0xcab22f5d729ab8c6ull &&
+			    table_offset == 1760u) {
+				indirect.key_count = Value(ShaderInfo::MaxImages);
+			}
 			known_key_count = !indirect.key_count.IsEmpty();
 			if (known_key_count && ((table_offset & 3u) != 0u ||
 			                        (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u)))) {
@@ -1912,6 +1928,16 @@ private:
 			     ImmediateU32(bound_inst->Arg(1), bound_cap)) &&
 			    bound_cap > 0u && bound_cap <= INT32_MAX) {
 				indirect.selector_limit = bound_cap;
+				if (ValidateRuntimeValue(m_program, loop_bound, RuntimeValueType::Integer)) {
+					indirect.selector_count = loop_bound;
+				}
+			}
+			if (m_program.shader_hash == 0x82527951ad9793e5ull &&
+			    table_offset == 152u) {
+				std::fprintf(stderr,
+				             "HFW image plan: selector cap=%u runtime count=%u offset=%u stride=%u\n",
+				             indirect.selector_limit, !indirect.selector_count.IsEmpty(),
+				             indirect.selector_offset, indirect.selector_stride);
 			}
 			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
 			if (material_handle == nullptr ||
@@ -2162,6 +2188,17 @@ private:
 		}
 		const auto& memory = m_program.memory_info[flags.index];
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
+			return;
+		}
+		if (m_program.shader_hash == 0x7f444d45d935a544ull &&
+		    (flags.pc == 0x00000dd8u || flags.pc == 0x00000e98u ||
+		     flags.pc == 0x00000f38u) &&
+		    op == ValueOpcode::ImageWrite) {
+			// Diagnostic: this path passes a ballot mask in SGPR0 as an image descriptor.
+			// Drop the invalid store to see whether the loading screen progresses.
+			std::fprintf(stderr, "HFW diagnostic: skipped invalid image store at pc 0x%08x\n",
+			             flags.pc);
+			inst.Invalidate();
 			return;
 		}
 		Inst*    handle   = nullptr;

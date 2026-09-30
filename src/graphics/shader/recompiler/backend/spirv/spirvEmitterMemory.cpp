@@ -816,7 +816,28 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	           Select(state, TypeU32(state), add_tid, BufferLane(state), ConstantU32(state, 0)));
 	const auto soffset = ctx.Arg(inst, 3);
 	const auto base    = DeviceAddressFromWords(state, ctx.Arg(handle, 0), field(word1, 0, 16));
-	const auto valid_format    = nonzero(field(word3, 12, 7));
+	const auto format = field(word3, 12, 7);
+	auto valid_format = nonzero(format);
+	if (ctx.Memory(inst).formatted) {
+		const auto in_range = AndCondition(
+		    state,
+		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(
+		                                  Prospero::BufferFormat::k32_32_32UInt))),
+		    Binary(state, spv::OpULessThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(
+		                                  Prospero::BufferFormat::k32_32_32_32Float))));
+		const auto identity_xyz = AndCondition(
+		    state,
+		    Binary(state, spv::OpIEqual, TypeBool(state), field(word3, 0, 3),
+		           ConstantU32(state, 4u)),
+		    AndCondition(state,
+		                 Binary(state, spv::OpIEqual, TypeBool(state), field(word3, 3, 3),
+		                        ConstantU32(state, 5u)),
+		                 Binary(state, spv::OpIEqual, TypeBool(state), field(word3, 6, 3),
+		                        ConstantU32(state, 6u))));
+		valid_format = AndCondition(state, in_range, identity_xyz);
+	}
 	const auto mode            = field(word3, 28, 2);
 	const auto index_in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, records);
 	const auto scalar_in_bounds =

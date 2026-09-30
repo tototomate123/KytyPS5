@@ -93,6 +93,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::SMin32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -580,6 +581,14 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::UMin32:
 			if (binary()) {
 				result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				return true;
+			}
+			return false;
+		case ValueOpcode::SMin32:
+			if (binary()) {
+				result = std::bit_cast<uint32_t>(std::min(
+				    std::bit_cast<int32_t>(static_cast<uint32_t>(a)),
+				    std::bit_cast<int32_t>(static_cast<uint32_t>(b))));
 				return true;
 			}
 			return false;

@@ -62,6 +62,14 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 } // namespace Libs::Fiber
 
+namespace Libs::LibAmpr::Ampr {
+int TestAmmGiveAutoMemory(uint64_t size);
+int TestAmmMap(uint64_t va, uint64_t size, uint64_t direct_offset, int prot);
+int TestAmmUnmap(uint64_t va, uint64_t size);
+uint64_t TestAmmAutoFreeBytes();
+void TestAmmResetAutoMemory();
+} // namespace Libs::LibAmpr::Ampr
+
 namespace {
 
 using Libs::LibKernel::Memory::VirtualQueryInfo;
@@ -3263,10 +3271,133 @@ void TestSmallFiberStacksAndMigration() {
 }
 #endif
 
+void TestAmmAutoBackingReuse() {
+	using namespace Libs::LibAmpr::Ampr;
+	namespace Memory = Libs::LibKernel::Memory;
+	const char* test = "AmmAutoBackingReuse";
+	constexpr uint64_t page = SceKernelPageSize;
+	constexpr uint64_t va = Libs::LibKernel::Memory::kExtendedMemoryBase + 0x1000000ull;
+	constexpr uint64_t other = va + 0x100000;
+	constexpr uint64_t alias = other + 0x100000;
+	auto map = [&](uint64_t address, uint64_t size) {
+		CheckOk(test, TestAmmMap(address, size, UINT64_MAX, SceKernelProtCpuRw), "AMM map auto");
+	};
+	auto unmap = [&](uint64_t address, uint64_t size) {
+		CheckOk(test, TestAmmUnmap(address, size), "AMM unmap");
+	};
+	auto offset = [&](uint64_t address) {
+		VirtualQueryInfo info {};
+		CheckOk(test, Memory::KernelVirtualQuery(reinterpret_cast<void*>(address), 0, &info, sizeof(info)),
+		        "query AMM backing");
+		return info.offset + address - info.start;
+	};
+	auto free_is = [&](uint64_t bytes) {
+		Check(test, TestAmmAutoFreeBytes() == bytes, "unexpected free automatic backing");
+	};
+	TestAmmResetAutoMemory();
+	CheckOk(test, TestAmmGiveAutoMemory(8 * page), "give automatic pool");
+	free_is(8 * page);
+
+	// A long map/unmap cycle must use the same donated backing without consuming
+	// fresh direct memory on every iteration.
+	map(va, 4 * page);
+	const auto first = offset(va);
+	for (unsigned i = 0; i < 100; ++i) {
+		free_is(4 * page);
+		unmap(va, 4 * page);
+		free_is(8 * page);
+		map(va, 4 * page);
+		Check(test, offset(va) == first, "map/unmap cycle did not reuse backing");
+	}
+
+	// Recycle a hole in the middle while preserving both live neighbors.
+	*reinterpret_cast<uint64_t*>(va) = 0x1122334455667788ull;
+	*reinterpret_cast<uint64_t*>(va + 3 * page) = 0x8877665544332211ull;
+	unmap(va + page, 2 * page);
+	free_is(6 * page);
+	map(other, 2 * page);
+	Check(test, offset(other) == first + page, "partial unmap did not return its physical extent");
+	std::memset(reinterpret_cast<void*>(other), 0x5a, 2 * page);
+	Check(test, *reinterpret_cast<uint64_t*>(va) == 0x1122334455667788ull &&
+	                *reinterpret_cast<uint64_t*>(va + 3 * page) == 0x8877665544332211ull,
+	      "reusing an unmapped hole corrupted a live neighbor");
+	unmap(va, page);
+	unmap(va + 3 * page, page);
+	unmap(other, 2 * page);
+	free_is(8 * page);
+	map(va, 8 * page);
+	Check(test, offset(va) == first, "free extents did not coalesce");
+	unmap(va, 8 * page);
+
+	// A fixed replacement retires just the replaced portion of an automatic mapping.
+	map(va, 2 * page);
+	*reinterpret_cast<uint64_t*>(va) = 0xaabbccdd;
+	map(va + page, page);
+	free_is(6 * page);
+	Check(test, offset(va) == first && *reinterpret_cast<uint64_t*>(va) == 0xaabbccdd,
+	      "partial replacement changed the surviving mapping");
+	unmap(va, 2 * page);
+	free_is(8 * page);
+
+	// Failure before host mapping must return the reserved backing. Failed unmaps
+	// must keep the live allocation unavailable.
+	map(va, 2 * page);
+	CheckFailed(test, TestAmmMap(other, page, UINT64_MAX, SceKernelProtCpuExec), "invalid AMM map");
+	free_is(6 * page);
+	CheckFailed(test, TestAmmUnmap(other, page), "unmap absent AMM range");
+	free_is(6 * page);
+	unmap(va, 2 * page);
+	free_is(8 * page);
+
+	// A direct alias keeps the old automatic backing alive after its original VA
+	// is unmapped. Reusing it early would silently corrupt the alias.
+	map(va, 2 * page);
+	const auto aliased_offset = offset(va);
+	*reinterpret_cast<uint64_t*>(va) = 0xfeedface;
+	CheckOk(test, TestAmmMap(alias, 2 * page, aliased_offset, SceKernelProtCpuRw), "map direct alias");
+	unmap(va, 2 * page);
+	free_is(6 * page);
+	map(other, 2 * page);
+	Check(test, offset(other) != aliased_offset, "reused backing still held by a direct alias");
+	std::memset(reinterpret_cast<void*>(other), 0, 2 * page);
+	Check(test, *reinterpret_cast<uint64_t*>(alias) == 0xfeedface, "direct alias contents changed");
+	unmap(other, 2 * page);
+	unmap(alias, 2 * page);
+	free_is(8 * page);
+
+	// Direct mappings supplied by the guest must never become automatic-pool memory.
+	int64_t external = 0;
+	CheckOk(test, Memory::KernelAllocateMainDirectMemory(page, page, 12, &external), "allocate external direct backing");
+	CheckOk(test, TestAmmMap(other, page, external, SceKernelProtCpuRw), "map external direct backing");
+	unmap(other, page);
+	free_is(8 * page);
+	CheckOk(test, Memory::KernelCheckedReleaseDirectMemory(external, page), "release external direct backing");
+
+	// Automatic maps reserve donated backing. Exhaustion leaves the pool intact;
+	// donating another range makes a larger mapping possible.
+	CheckFailed(test, TestAmmMap(other, 9 * page, UINT64_MAX, SceKernelProtCpuRw), "exhausted automatic backing");
+	free_is(8 * page);
+	CheckFailed(test, TestAmmMap(other, 9 * page, UINT64_MAX, SceKernelProtCpuRw), "repeat exhausted automatic backing");
+	free_is(8 * page);
+	CheckOk(test, TestAmmGiveAutoMemory(9 * page), "give second automatic pool");
+	map(other, 9 * page);
+	free_is(8 * page);
+	unmap(other, 9 * page);
+	free_is(17 * page);
+	map(other, 9 * page);
+	unmap(other, 9 * page);
+	free_is(17 * page);
+	TestAmmResetAutoMemory();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--amm-only") == 0) {
+		RunTest(TestAmmAutoBackingReuse);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
 		RunTest(TestSmallFiberStacksAndMigration);
@@ -3345,6 +3476,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestAmmAutoBackingReuse);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

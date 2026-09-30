@@ -294,7 +294,8 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
                                                       bool shared_selector = true,
                                                       bool invalid_selector_leaf = false,
                                                       bool bounded_loop = false,
-                                                      bool written_output = false) {
+                                                      bool written_output = false,
+                                                      bool split_backedge = false) {
   auto fixture = std::make_unique<Fixture>();
   const auto root = fixture->Address(fixture->UserData(7), fixture->UserData(8), 0x11f0);
   const auto load_root_word = [&](uint32_t offset, uint32_t pc) {
@@ -319,11 +320,13 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
   auto *loop = fixture->AddBlock();
   auto *body = bounded_loop ? fixture->AddBlock() : loop;
   auto *done = bounded_loop ? fixture->AddBlock() : nullptr;
+  auto *backedge = split_backedge ? fixture->AddBlock() : body;
   entry->AddBranch(loop);
   if (bounded_loop) {
     loop->AddBranch(body);
     loop->AddBranch(done);
-    body->AddBranch(loop);
+    body->AddBranch(backedge);
+    if (split_backedge) backedge->AddBranch(loop);
   } else {
     loop->AddBranch(loop);
   }
@@ -332,7 +335,7 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
   const auto carried = fixture->Emit(
       ValueOpcode::IAdd32, {Value(&selector_phi), Value(1u)}, 0, body);
   selector_phi.AddPhiOperand(entry, Value(0u));
-  selector_phi.AddPhiOperand(body, carried);
+  selector_phi.AddPhiOperand(backedge, carried);
   if (bounded_loop) {
     const auto bound = fixture->Emit(ValueOpcode::SMin32,
                                      {fixture->UserData(11), Value(2u)}, 0, entry);
@@ -488,6 +491,12 @@ void TestInvariantIndirectImageMaterialization() {
       bounded_written->program.info.images[0].source].indirect_image;
   Check(written_indirect && written_indirect->selector_limit == 2u,
         "unrelated shader write disabled the loop index bound");
+  auto split_backedge = MakeAddressBackedImageFixture(0u, true, false, true, false, true);
+  split_backedge->PlanAndTrack();
+  const auto &split_indirect = split_backedge->program.descriptor_sources[
+      split_backedge->program.info.images[0].source].indirect_image;
+  Check(split_indirect && split_indirect->selector_limit == 2u,
+        "empty backedge block hid the signed-clamped image key bound");
   const auto bounded_plan = ExtractResourcePlan(bounded->program);
   ResourceSnapshot bounded_snapshot;
   ResourceSpecialization bounded_specialization;
@@ -496,6 +505,27 @@ void TestInvariantIndirectImageMaterialization() {
             bounded_snapshot.flattened_srt[
                 bounded_specialization.images[0].indirect_mapping_offset] == 2u,
         "bounded loop enumerated wrapped image keys outside its range");
+  LinearTestMemory active_memory = address_memory;
+  active_memory.words.resize(0x2400 / 4);
+  active_memory.words[(0x3000u + 368u + 384u - active_memory.base) / 4u] =
+      0x42880000u;
+  std::array<uint32_t, 12> active_user_data{};
+  std::copy(address_user_data.begin(), address_user_data.end(),
+            active_user_data.begin());
+  active_user_data[11] = 1u;
+  const SrtRuntime active_runtime{.user_data = active_user_data,
+                                  .read_memory = ReadLinearTestMemory,
+                                  .userdata = &active_memory,
+                                  .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(bounded_plan, active_runtime, bounded_snapshot,
+                             bounded_specialization) &&
+            bounded_snapshot.flattened_srt[
+                bounded_specialization.images[0].indirect_mapping_offset] == 2u,
+        "bounded loop read an inactive material record as an image key");
+  active_user_data[11] = 0u;
+  Check(MaterializeResources(bounded_plan, active_runtime, bounded_snapshot,
+                             bounded_specialization),
+        "zero material count did not produce a safe image fallback");
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
   Check(fixture->program.info.images[0].simple_2d_3d_sampling,
@@ -1132,9 +1162,52 @@ void TestBufferRecordImageKey() {
   ApplyResourceSpecialization(fixture->program, specialization);
   Check(fixture->program.info.images[0].indirect_resources.size() == 4u,
         "dimension query specialization discarded its runtime candidates");
+  memory.words[5] = 0x43800000u; // Inactive record contains float bits, not an image key.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "unmapped descriptor from an inactive record rejected the shader");
+  const auto& mapping = snapshot.flattened_srt;
+  const auto invalid_key = std::find(mapping.begin(), mapping.end(), 0x43800000u);
+  Check(invalid_key != mapping.end() && invalid_key + 1 != mapping.end() &&
+            *(invalid_key + 1) == 0u,
+        "unmapped record key did not select the null descriptor");
   user_data[7] = 0x1000u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "written buffer alias with a record key was accepted");
+}
+
+void TestIndirectFormattedXYZBuffer() {
+  Fixture fixture;
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                {fixture.Emit(ValueOpcode::LaneId), Value(true)});
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                    {key, Value(4u)});
+  std::array<Value, 4> words;
+  for (uint32_t i = 0; i < words.size(); ++i) {
+    MemoryInfo read;
+    read.kind = ResourceKind::ScalarAddress;
+    read.offset = i * 4u;
+    words[i] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                            {table, offset, Value(0u), Value(true)},
+                            fixture.AddMemory(read, 0x20));
+  }
+  const auto buffer = fixture.Buffer(words, 0x40);
+  MemoryInfo formatted;
+  formatted.kind = ResourceKind::Buffer;
+  formatted.formatted = true;
+  formatted.data_bits = 32u;
+  formatted.data_dwords = 3u;
+  const auto flags = fixture.AddMemory(formatted, 0x44);
+  const auto loaded = fixture.Emit(ValueOpcode::LoadBufferU32x3,
+                                    {buffer, fixture.UserData(2), Value(0u), Value(0u),
+                                     Value(true)}, flags);
+  const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x3,
+                                       {loaded, Value(2u)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {component});
+  fixture.PlanAndTrack();
+  Check(fixture.program.memory_info[flags.index].kind == ResourceKind::IndirectBuffer &&
+            fixture.program.info.uses_dma,
+        "dynamic formatted XYZ buffer was not routed through GPU address mapping");
 }
 
 void TestGuardedDirectImageTable() {
@@ -2344,6 +2417,27 @@ void TestRuntimeUnsignedMinDescriptor() {
       SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, value) &&
           value.dwords[3] == 0x80u,
       "runtime descriptor unsigned minimum did not preserve its first operand");
+}
+
+void TestRuntimeSignedMin() {
+  Fixture fixture;
+  const auto count = fixture.Emit(ValueOpcode::SMin32,
+                                  {fixture.UserData(0), Value(20u)});
+  Check(ValidateRuntimeValue(fixture.program, count, RuntimeValueType::Integer),
+        "runtime signed minimum was rejected");
+  std::array<uint32_t, 1> user_data{8u};
+  uint32_t result = 0;
+  Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(count, result) &&
+            result == 8u,
+        "runtime signed minimum changed an in-range count");
+  user_data[0] = 24u;
+  Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(count, result) &&
+            result == 20u,
+        "runtime signed minimum did not apply its cap");
+  user_data[0] = 0xffffffffu;
+  Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(count, result) &&
+            result == 0xffffffffu,
+        "runtime signed minimum treated a negative count as unsigned");
 }
 
 void TestImagesSamplersAndAliases() {
@@ -3723,6 +3817,7 @@ int main() {
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
+    Run("runtime signed min", TestRuntimeSignedMin);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
@@ -3731,6 +3826,7 @@ int main() {
     Run("shared uniform loop index", TestSharedUniformLoopIndex);
     Run("bounded address image keys", TestBoundedAddressImageKeys);
     Run("buffer record image key", TestBufferRecordImageKey);
+    Run("indirect formatted XYZ buffer", TestIndirectFormattedXYZBuffer);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);

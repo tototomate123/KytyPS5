@@ -1,7 +1,10 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/loadDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -42,6 +45,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Refresh();
 	if (IsFree(tick)) {
 		return;
+	}
+	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+		std::fprintf(stderr, "HFW GPU wait: target=%" PRIu64 " completed=%" PRIu64 "\n",
+		             tick, KnownGpuTick());
 	}
 
 	vk::SemaphoreWaitInfo wait_info {};

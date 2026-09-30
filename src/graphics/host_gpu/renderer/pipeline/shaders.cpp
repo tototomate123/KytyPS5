@@ -523,6 +523,25 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	rendering_info.pColorAttachmentFormats = rendering.color_formats.data();
 	rendering_info.depthAttachmentFormat   = rendering.depth_format;
 	rendering_info.stencilAttachmentFormat = rendering.stencil_format;
+	std::array<vk::SampleCountFlagBits, RENDER_COLOR_ATTACHMENTS_MAX> color_sample_counts {};
+	vk::AttachmentSampleCountInfoAMD mixed_sample_info {};
+	if (rendering.depth_samples != 0u &&
+	    std::ranges::any_of(rendering.color_samples.begin(),
+	                        rendering.color_samples.begin() + rendering.color_count,
+	                        [&](uint32_t samples) {
+		                        return samples != 0u && samples != rendering.depth_samples;
+	                        })) {
+		EXIT_IF(!graphics.mixed_attachment_samples_enabled);
+		for (uint32_t i = 0; i < rendering.color_count; ++i) {
+			color_sample_counts[i] = vulkan_sample_count(
+			    rendering.color_samples[i] == 0u ? static_params.samples : rendering.color_samples[i]);
+		}
+		mixed_sample_info.colorAttachmentCount          = rendering.color_count;
+		mixed_sample_info.pColorAttachmentSamples       = color_sample_counts.data();
+		mixed_sample_info.depthStencilAttachmentSamples =
+		    vulkan_sample_count(rendering.depth_samples);
+		rendering_info.pNext = &mixed_sample_info;
+	}
 	pipeline_info.pNext                    = &rendering_info;
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;

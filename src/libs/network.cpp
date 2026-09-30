@@ -26,6 +26,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/loadDiagnostics.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -1759,6 +1760,7 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 	}
 
 	LOGF("\t fd = %d\n", fd);
+	LoadDiagnostics::SocketCreated(p2p || type == SOCK_DGRAM);
 	return fd;
 }
 
@@ -1874,6 +1876,7 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
 		return -1;
 	}
+	LoadDiagnostics::ConnectAttempted();
 
 	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
 		return SetHostSocketError();
@@ -2173,6 +2176,7 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 	if (result < 0) {
 		return SetHostSocketError();
 	}
+	LoadDiagnostics::NetworkSend();
 
 	return result;
 }

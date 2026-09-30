@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/loadDiagnostics.h"
 #include "common/logging/log.h"
 #include "libs/ajm/aac_decoder.h"
 #include "libs/ajm/atrac9_decoder.h"
@@ -26,6 +27,23 @@
 namespace Libs::Audio::Ajm {
 
 LIB_NAME("Ajm", "Ajm");
+
+int KYTY_SYSV_ABI AjmDecMp3ParseFrame(const uint8_t* data, uint32_t size, int parse_ofl,
+                                   AjmDecMp3FrameInfo* info) {
+	const int result = AjmParseMp3Frame(data, size, parse_ofl, info);
+	if (LoadDiagnostics::Enabled()) {
+		static std::atomic_uint32_t logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("AJM MP3 parse: bytes=%u parse_ofl=%d result=0x%08x frame=%llu "
+			            "channels=%u rate=%u delay=%u ofl=%u\n",
+			            size, parse_ofl, static_cast<unsigned>(result),
+			            result == 0 ? static_cast<unsigned long long>(info->frame_size) : 0ull,
+			            result == 0 ? info->num_channels : 0, result == 0 ? info->sample_rate : 0,
+			            result == 0 ? info->encoder_delay : 0, result == 0 ? info->ofl_type : 0);
+		}
+	}
+	return result;
+}
 
 struct AjmBatchInfo {
 	void*       buffer;

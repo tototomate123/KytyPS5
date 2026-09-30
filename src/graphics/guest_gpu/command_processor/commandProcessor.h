@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -40,6 +41,14 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	// Diagnostic state follows the suspended execution, including CE/DE and indirect buffers.
+	const uint32_t*                      m_diagnostic_packet = nullptr;
+	std::chrono::steady_clock::time_point m_diagnostic_since {};
+	int64_t                             m_diagnostic_report_ms    = -10000;
+	uint64_t                            m_diagnostic_wait_address = 0;
+	uint64_t                            m_diagnostic_wait_value   = 0;
+	uint64_t                            m_diagnostic_wait_ref     = 0;
+	uint64_t                            m_diagnostic_wait_mask    = 0;
 };
 
 class CommandProcessor {

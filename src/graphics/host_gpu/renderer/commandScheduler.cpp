@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/loadDiagnostics.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -386,6 +387,15 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+		std::fprintf(stderr,
+		             "HFW GPU submit: tick=%" PRIu64 " op=%u submit=%" PRIu64
+		             " args=%u,%u,%u,%u,0x%016" PRIx64 " gpu=%" PRIu64 "\n",
+		             tick, m_command.m_debug_op, m_command.m_debug_submit_id,
+		             m_command.m_debug_arg0, m_command.m_debug_arg1, m_command.m_debug_arg2,
+		             m_command.m_debug_arg3, m_command.m_debug_arg4,
+		             m_master.KnownGpuTick());
+	}
 
 	m_command.m_buffer = nullptr;
 	return tick;

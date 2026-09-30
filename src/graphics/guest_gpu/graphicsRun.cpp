@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/loadDiagnostics.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -315,7 +316,14 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	const auto value = *addr;
+	if (LoadDiagnostics::Enabled() && g_current_execution != nullptr) {
+		g_current_execution->m_diagnostic_wait_address = reinterpret_cast<uint64_t>(addr);
+		g_current_execution->m_diagnostic_wait_value = value;
+		g_current_execution->m_diagnostic_wait_ref = ref;
+		g_current_execution->m_diagnostic_wait_mask = mask;
+	}
+	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -752,7 +760,40 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
+			if (LoadDiagnostics::Enabled()) {
+				const auto now = std::chrono::steady_clock::now();
+				if (execution.m_diagnostic_packet != packet) {
+					execution.m_diagnostic_packet = packet;
+					execution.m_diagnostic_since = now;
+					execution.m_diagnostic_report_ms = -10000;
+				}
+				const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				    now - execution.m_diagnostic_since).count();
+				if (age_ms >= 1000 && age_ms - execution.m_diagnostic_report_ms >= 10000) {
+					execution.m_diagnostic_report_ms = age_ms;
+					std::printf("GPU wait stalled: queue=%s event_id=0x%x submit=%" PRIu64
+					            " packet=%p opcode=0x%02x age_ms=%lld CE=%u DE=%u ce_complete=%u\n",
+					            IsAsyncComputeQueue() ? "compute" : "graphics", m_interrupt_event_id,
+					            m_submit_id, static_cast<const void*>(packet), opcode,
+					            static_cast<long long>(age_ms), m_ce_count, m_de_count, m_ce_complete);
+					if (opcode == Pm4::IT_WAIT_REG_MEM || opcode == Pm4::IT_WAIT_REG_MEM_64) {
+						std::printf("GPU wait value: address=0x%" PRIx64 " current=0x%" PRIx64
+						            " reference=0x%" PRIx64 " mask=0x%" PRIx64 " compare=%u width=%u\n",
+						            execution.m_diagnostic_wait_address, execution.m_diagnostic_wait_value,
+						            execution.m_diagnostic_wait_ref, execution.m_diagnostic_wait_mask,
+						            packet[1] & 7u, opcode == Pm4::IT_WAIT_REG_MEM ? 32u : 64u);
+					}
+				}
+			}
 			return;
+		}
+		if (LoadDiagnostics::Enabled() && execution.m_diagnostic_packet != nullptr) {
+			if (execution.m_diagnostic_report_ms >= 0) {
+				std::printf("GPU wait resumed: queue=%s event_id=0x%x submit=%" PRIu64 " packet=%p\n",
+				            IsAsyncComputeQueue() ? "compute" : "graphics", m_interrupt_event_id,
+				            m_submit_id, static_cast<const void*>(execution.m_diagnostic_packet));
+			}
+			execution.m_diagnostic_packet = nullptr;
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;

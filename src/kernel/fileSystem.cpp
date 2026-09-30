@@ -8,6 +8,7 @@
 #include "common/file.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
+#include "common/loadDiagnostics.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/memory.h"
@@ -478,6 +479,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	if (trunc && rw_mode == Common::File::Mode::Read) {
+		LoadDiagnostics::FileOpenFailed(path);
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_EACCES;
 	}
@@ -488,12 +490,14 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	// A missing path opened without O_CREAT is ENOENT
 	if (!creat && !dir_exist && !file_exist) {
+		LoadDiagnostics::FileOpenFailed(path);
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
 	}
 
 	if (directory || dir_exist) {
 		if (!dir_exist) {
+			LoadDiagnostics::FileOpenFailed(path);
 			g_files->DeleteDescriptor(descriptor);
 			return KERNEL_ERROR_ENOTDIR;
 		}
@@ -517,6 +521,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		bool result = false;
 
 		if (excl && creat && file_exist) {
+			LoadDiagnostics::FileOpenFailed(path);
 			g_files->DeleteDescriptor(descriptor);
 			return KERNEL_ERROR_EEXIST;
 		}
@@ -543,12 +548,14 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		}
 
 		if (!result || file->f.IsInvalid()) {
+			LoadDiagnostics::FileOpenFailed(path);
 			g_files->DeleteDescriptor(descriptor);
 			return KERNEL_ERROR_EACCES;
 		}
 	}
 
 	file->opened = true;
+	LoadDiagnostics::FileOpen();
 	return descriptor;
 }
 
@@ -648,6 +655,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	}
 
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
+	LoadDiagnostics::FileRead(file->name.c_str(), bytes_read);
 
 	return bytes_read;
 }
@@ -776,6 +784,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
 	     Common::PathToString(file->real_name).c_str());
+	LoadDiagnostics::FileRead(file->name.c_str(), bytes_read);
 
 	return bytes_read;
 }
@@ -877,6 +886,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	}
 	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,
 	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
+	LoadDiagnostics::FileRead(file->name.c_str(), static_cast<uint64_t>(bytes_read));
 	return bytes_read;
 }
 
@@ -1075,6 +1085,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	auto real_file_name = g_mount_points->ResolvePath(path);
 
 	const auto info = Common::File::GetInfo(real_file_name);
+	LoadDiagnostics::FileStat(path, info.has_value());
 	if (!info) {
 		LOGF("\t file not found\n");
 		return KERNEL_ERROR_ENOENT;

@@ -117,6 +117,10 @@ int KYTY_SYSV_ABI VoiceQoSInit(void* mem_block, uint32_t mem_size, int32_t app_t
 
 namespace Ajm {
 
+struct AjmDecMp3FrameInfo;
+int KYTY_SYSV_ABI AjmDecMp3ParseFrame(const uint8_t* data, uint32_t size, int parse_ofl,
+                                   AjmDecMp3FrameInfo* info);
+
 struct AjmBatchInfo;
 struct AjmBatchError;
 struct AjmBuffer;

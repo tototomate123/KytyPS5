@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/loadDiagnostics.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 namespace Libs::Graphics {
 
@@ -51,6 +53,13 @@ void CommandBuffer::End() const {
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
                                  uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+		const auto tick = m_context.GetCommandScheduler().CurrentTick();
+		std::fprintf(stderr,
+		             "HFW GPU command: tick=%" PRIu64 " op=%u submit=%" PRIu64
+		             " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+		             tick, op, submit_id, arg0, arg1, arg2, arg3, arg4);
+	}
 	m_debug_op        = op;
 	m_debug_submit_id = submit_id;
 	m_debug_arg0      = arg0;

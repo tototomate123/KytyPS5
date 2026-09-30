@@ -69,8 +69,10 @@ static_assert(sizeof(PipelineStaticParameters) == 126);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
+	std::array<uint32_t, RENDER_COLOR_ATTACHMENTS_MAX>  color_samples {};
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
+	uint32_t                                             depth_samples  = 0;
 	uint32_t                                             color_count    = 0;
 
 	bool operator==(const PipelineRenderingState&) const = default;

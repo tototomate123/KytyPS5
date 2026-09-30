@@ -1779,7 +1779,7 @@ void TestGuardedDirectImageTable() {
 }
 
 void TestExpandedImageTables(bool lane_selected = false, bool active_guard = true,
-                             bool equal_key = true) {
+                             bool equal_key = true, bool bit_field = false) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture;
   auto *entry = fixture.block;
@@ -1809,8 +1809,9 @@ void TestExpandedImageTables(bool lane_selected = false, bool active_guard = tru
   const uint32_t candidates = lane_selected ? 16u : 32u;
   if (lane_selected) {
     const auto active = fixture.Emit(ValueOpcode::INotEqual32, {mask, Value(0u)}, 0, entry);
-    const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
-                                     {mask, Value(15u)}, 0, entry);
+    const auto masked = bit_field ? fixture.Emit(ValueOpcode::BitFieldUExtract,
+        {mask, Value(8u), Value(4u)}, 0, entry) : fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {mask, Value(15u)}, 0, entry);
     const auto local = fixture.Emit(ValueOpcode::SelectU32,
                                      {active, masked, fixture.UserData(3)}, 0, entry);
     key = fixture.Emit(ValueOpcode::ReadLane, {local, Value(0u)}, 0, header);
@@ -4353,6 +4354,7 @@ int main() {
     Run("expanded image tables", [] { TestExpandedImageTables(); });
     Run("masked lane image tables", [] {
       TestExpandedImageTables(true);
+      TestExpandedImageTables(true, true, true, true);
       TestExpandedImageTables(true, false);
       TestExpandedImageTables(true, true, false);
     });

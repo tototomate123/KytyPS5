@@ -1404,6 +1404,14 @@ private:
 			return ImpliesLoopGuard(guard, inst->Arg(0)) &&
 			       BoundU32(inst->Arg(1), guard, bounds, depth + 1u);
 		}
+		if (op == ValueOpcode::BitFieldUExtract && inst->NumArgs() == 3u) {
+			uint32_t start = 0;
+			uint32_t width = 0;
+			if (!ImmediateU32(inst->Arg(1), start) || !ImmediateU32(inst->Arg(2), width) ||
+			    start >= 32u || width == 0u || width > 32u - start) return false;
+			bounds = {0u, width == 32u ? UINT32_MAX : (1u << width) - 1u, 0u};
+			return true;
+		}
 		if (inst->NumArgs() != 2u) return false;
 		if (op == ValueOpcode::BitwiseAnd32 &&
 		    (ImmediateU32(inst->Arg(0), immediate) || ImmediateU32(inst->Arg(1), immediate))) {

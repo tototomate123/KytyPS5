@@ -305,15 +305,18 @@ public:
 				plan.handle->SetArg(dword, plan.key);
 			}
 			for (const auto index: plan.memory) {
-				m_program.memory_info[index].planning_only = true;
+				if (IsIndirectPlanningMemory(index)) m_program.memory_info[index].planning_only = true;
 			}
 		}
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
-			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-			                   [&](const IndirectImagePlan& plan) {
-				                   return std::ranges::find(plan.reads, inst) != plan.reads.end();
-			                   });
+			for (const auto& plan: m_indirect_images) {
+				for (size_t i = 0; i < plan.reads.size(); ++i) {
+					if (plan.reads[i] == inst && IsIndirectPlanningMemory(plan.memory[i]))
+						return true;
+				}
+			}
+			return false;
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
@@ -347,6 +350,7 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+		std::array<bool, 8>       retained {};
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -2091,11 +2095,11 @@ private:
 				return false;
 			}
 			table_handle = current_handle;
-			if (!UsesOnlyImageHandles(*read)) {
-				return false;
-			}
 			plan.memory[dword] = memory_index;
 			plan.reads[dword]  = read;
+			// Descriptor bits can also feed the shader's dimension arithmetic.
+			// Keep those reads as GPU address loads while specializing the image.
+			plan.retained[dword] = !UsesOnlyImageHandles(*read);
 		}
 
 		DescriptorSource table_source;
@@ -2230,10 +2234,15 @@ private:
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-		                   [&](const IndirectImagePlan& plan) {
-			                   return std::ranges::find(plan.memory, index) != plan.memory.end();
-		                   });
+		bool found = false;
+		for (const auto& plan: m_indirect_images) {
+			for (size_t i = 0; i < plan.memory.size(); ++i) {
+				if (plan.memory[i] != index) continue;
+				if (plan.retained[i]) return false;
+				found = true;
+			}
+		}
+		return found;
 	}
 
 	void PlanIndirectImages() {

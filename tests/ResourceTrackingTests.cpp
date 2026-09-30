@@ -1495,7 +1495,7 @@ void TestMaskedScalarBufferImageKeys(bool nested = false, bool gather = false) {
   }
 }
 
-void TestStridedHighBitsImageTable(uint32_t clamp = 0u) {
+void TestStridedHighBitsImageTable(uint32_t clamp = 0u, bool descriptor_dimensions = false) {
   Fixture fixture;
   const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
   auto key = fixture.Emit(ValueOpcode::ShiftRightLogical32,
@@ -1519,6 +1519,7 @@ void TestStridedHighBitsImageTable(uint32_t clamp = 0u) {
     image_words[dword] = fixture.Emit(ValueOpcode::LoadAddressU32,
         {table, table_offset, Value(0u), Value(true)},
         fixture.AddMemory(read, 0x20));
+    if (descriptor_dimensions) fixture.program.dynamic_reads.push_back(image_words[dword]);
   }
   const auto image = fixture.Image(image_words, 0x30);
   const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
@@ -1528,8 +1529,13 @@ void TestStridedHighBitsImageTable(uint32_t clamp = 0u) {
   const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
                                     {image, sampler, fixture.ImageAddress()},
                                     fixture.AddMemory(sample, 0x34));
-  const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+  auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
                                        {sampled, Value(0u)});
+  if (descriptor_dimensions) {
+    const auto width = fixture.Emit(ValueOpcode::BitFieldUExtract,
+                                    {image_words[2], Value(0u), Value(14u)});
+    component = fixture.Emit(ValueOpcode::IAdd32, {component, width});
+  }
   const auto output = fixture.Buffer({fixture.UserData(3), fixture.UserData(4),
                                       fixture.UserData(5), fixture.UserData(6)});
   MemoryInfo store;
@@ -1539,6 +1545,14 @@ void TestStridedHighBitsImageTable(uint32_t clamp = 0u) {
                fixture.AddMemory(store, 0x38));
   fixture.PlanAndTrack();
   EliminateDeadCode(fixture.program.blocks);
+  if (descriptor_dimensions) {
+    const auto *read = image_words[2].TryInstruction();
+    Check(read->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+              !fixture.program.memory_info[read->Flags<MemoryFlags>().index].planning_only &&
+              fixture.program.info.uses_dma && fixture.program.dynamic_reads.size() == 1u &&
+              fixture.program.dynamic_reads[0] == image_words[2],
+          "image descriptor dimension read was removed from GPU execution");
+  }
   const auto &indirect = fixture.program.descriptor_sources[
       fixture.program.info.images.at(0).source].indirect_image;
   Check(indirect && indirect->table_stride == 68u &&
@@ -4352,6 +4366,7 @@ int main() {
     Run("nested scalar buffer image keys", [] { TestMaskedScalarBufferImageKeys(true); });
     Run("mixed numeric indirect gather", [] { TestMaskedScalarBufferImageKeys(true, true); });
     Run("strided high-bits image table", [] { TestStridedHighBitsImageTable(); });
+    Run("image descriptor dimension reads", [] { TestStridedHighBitsImageTable(0u, true); });
     Run("clamped high-bits image table", [] { TestStridedHighBitsImageTable(1u); });
     Run("reversed clamped image table", [] { TestStridedHighBitsImageTable(2u); });
     Run("guarded direct image table", TestGuardedDirectImageTable);

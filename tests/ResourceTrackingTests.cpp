@@ -1053,6 +1053,122 @@ void TestBoundedAddressImageKeys() {
   CheckBoundedAddressImageKeys(false, false);
 }
 
+void TestLaneSelectedAddressImageKeys() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  for (uint32_t variant = 0; variant < 4u; ++variant) {
+    Fixture fixture(Libs::Graphics::ShaderType::Pixel);
+    auto *entry = fixture.block;
+    auto *body = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(exit);
+    body->AddBranch(exit);
+    fixture.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 1u, .false_block = 2u};
+    fixture.program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
+    fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+    const auto active = fixture.Emit(ValueOpcode::INotEqual32,
+                                     {fixture.UserData(3), Value(0u)});
+    const auto clamp = fixture.Emit(ValueOpcode::UMin32,
+                                    {fixture.UserData(2), Value(7u)});
+    const auto local = fixture.Emit(ValueOpcode::SelectU32,
+                                    {active, clamp, fixture.UserData(2)});
+    const auto lane = fixture.Emit(ValueOpcode::ReadLane,
+                                   {local, fixture.UserData(4)});
+    const auto equal = fixture.Emit(ValueOpcode::IEqual32,
+        {lane, variant == 1u ? fixture.UserData(5) : local});
+    const auto guard = variant == 2u ? equal : fixture.Emit(
+        ValueOpcode::LogicalAnd, {active, equal});
+    fixture.program.block_info[0].condition = guard;
+    const auto pointer = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto group = fixture.Emit(ValueOpcode::ShiftRightLogical32,
+                                    {lane, Value(2u)}, 0, body);
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                      {group, Value(4u)}, 0, body), Value(16u)}, 0, body);
+    std::array<Value, 4> reads;
+    for (uint32_t i = 0; i < reads.size(); ++i) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = i * 4u;
+      reads[i] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {pointer, offset, Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x30), body);
+    }
+    const auto low = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                  {lane, Value(3u)}, 0, body);
+    auto selected = reads[0];
+    for (uint32_t i = 1; i < reads.size(); ++i) {
+      selected = fixture.Emit(ValueOpcode::SelectU32,
+          {fixture.Emit(ValueOpcode::IEqual32, {low, Value(i)}, 0, body),
+           reads[i], selected}, 0, body);
+    }
+    const auto key = fixture.Emit(ValueOpcode::IMul32,
+                                  {selected, Value(variant == 3u ? 0u : 24u)}, 0, body);
+    const auto table_offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                      {key, Value(5u)}, 0, body), Value(0x200u)}, 0, body);
+    std::array<Value, 8> words;
+    for (uint32_t i = 0; i < words.size(); ++i) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = i * 4u;
+      words[i] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {pointer, table_offset, Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x50), body);
+    }
+    fixture.block = body;
+    const auto image = fixture.Image(words, 0x50);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture.ImageAddress()}, fixture.AddMemory(sample, 0x50));
+    const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                                        {sampled, Value(0u)});
+    const auto result = fixture.Emit(ValueOpcode::SelectU32,
+                                     {guard, component, Value(0u)});
+    fixture.Emit(ValueOpcode::ReferenceU32, {result});
+    if (variant != 0u) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "lane-selected address key without a bounded active witness was accepted");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    const auto &indirect = fixture.program.descriptor_sources[
+        fixture.program.info.images.at(0).source].indirect_image;
+    Check(indirect && indirect->address_key && indirect->selector_offset == 16u &&
+              indirect->address_key_count == 8u && indirect->key_scale == 24u,
+          "lane-selected scalar vector material key was not tracked");
+    auto plan = ExtractResourcePlan(fixture.program);
+    LinearTestMemory memory;
+    for (uint32_t i = 0; i < 8u; ++i) memory.words[4u + i] = i & 1u;
+    std::array<uint32_t, 8> descriptor{};
+    descriptor[0] = 0x400u;
+    descriptor[1] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    descriptor[2] = 3u | (3u << 14u);
+    descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    for (const uint32_t key_value : {0u, 24u}) {
+      const auto index = (0x200u + key_value * 32u) / 4u;
+      std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + index);
+      memory.words[index] += key_value;
+    }
+    std::array<uint32_t, 6> user_data{0x1000u, 0u, 7u, 1u, 3u, 0u};
+    const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                             .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 2u,
+          "lane-selected address material keys were not materialized");
+  }
+}
+
 std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted, bool guarded = false) {
   auto fixture = std::make_unique<Fixture>();
   const auto material = fixture->Buffer({fixture->UserData(0), fixture->UserData(1),
@@ -4083,6 +4199,7 @@ int main() {
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("shared uniform loop index", TestSharedUniformLoopIndex);
     Run("bounded address image keys", TestBoundedAddressImageKeys);
+    Run("lane-selected address image keys", TestLaneSelectedAddressImageKeys);
     Run("buffer record image key", TestBufferRecordImageKey);
     Run("indirect formatted XY buffer", [] { TestIndirectFormattedBuffer(2u); });
     Run("indirect formatted XYZ buffer", [] { TestIndirectFormattedBuffer(3u); });

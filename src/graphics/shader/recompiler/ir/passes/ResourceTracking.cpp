@@ -1371,6 +1371,13 @@ private:
 		const auto* inst = value.Resolve().TryInstruction();
 		if (inst == nullptr) return false;
 		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadLane && inst->NumArgs() == 2u) {
+			// A waterfall loop compares the selected lane's key with each local
+			// key. Its active-lane witness bounds the uniform key, even if the
+			// selected lane itself was inactive before the comparison.
+			const auto local = EqualLocalKey(guard, value);
+			return !local.IsEmpty() && BoundU32(local, guard, bounds, depth + 1u);
+		}
 		if (op == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
 			return ImpliesLoopGuard(guard, inst->Arg(0)) &&
 			       BoundU32(inst->Arg(1), guard, bounds, depth + 1u);
@@ -1394,7 +1401,8 @@ private:
 		if (!ImmediateU32(inst->Arg(1), immediate) || immediate >= 32u ||
 		    !BoundU32(inst->Arg(0), guard, bounds, depth + 1u))
 			return false;
-		if (op == ValueOpcode::ShiftRightArithmetic32 && bounds.high <= INT32_MAX) {
+		if (op == ValueOpcode::ShiftRightLogical32 ||
+		    (op == ValueOpcode::ShiftRightArithmetic32 && bounds.high <= INT32_MAX)) {
 			bounds = {bounds.low >> immediate, bounds.high >> immediate,
 			          bounds.zero_bits > immediate ? bounds.zero_bits - immediate : 0u};
 			return true;
@@ -1457,6 +1465,14 @@ private:
 			uint32_t shift = 0;
 			return ImmediateU32(inst->Arg(1), shift) && shift < 32u &&
 			       CollectAddressKeyReads(inst->Arg(0), guard, scale * (1u << shift), bias, result,
+			                              depth + 1u);
+		}
+		if (op == ValueOpcode::IMul32 && inst->NumArgs() == 2u) {
+			uint32_t factor = 0;
+			const uint32_t side = ImmediateU32(inst->Arg(0), factor) ? 1u : 0u;
+			if (side == 0u && !ImmediateU32(inst->Arg(1), factor)) return false;
+			return factor != 0u && uint64_t {scale} * factor <= UINT32_MAX &&
+			       CollectAddressKeyReads(inst->Arg(side), guard, scale * factor, bias, result,
 			                              depth + 1u);
 		}
 		if (op != ValueOpcode::LoadAddressU32 || inst->NumArgs() != 4u ||

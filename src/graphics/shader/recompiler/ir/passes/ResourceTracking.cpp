@@ -1283,7 +1283,7 @@ private:
 	bool ImpliesLoopGuard(Value guard, Value required, std::vector<const Inst*>& active,
 	                      uint32_t depth = 0) const {
 		if (depth > 32u) return false;
-		guard    = guard.Resolve();
+		guard    = SimplifyGuard(guard);
 		required = required.Resolve();
 		if (EquivalentValue(m_program, guard, required)) return true;
 		const auto* inst = guard.TryInstruction();
@@ -1383,6 +1383,11 @@ private:
 			       BoundU32(inst->Arg(1), guard, bounds, depth + 1u);
 		}
 		if (inst->NumArgs() != 2u) return false;
+		if (op == ValueOpcode::BitwiseAnd32 &&
+		    (ImmediateU32(inst->Arg(0), immediate) || ImmediateU32(inst->Arg(1), immediate))) {
+			bounds = {0u, immediate, static_cast<uint32_t>(std::countr_zero(immediate))};
+			return true;
+		}
 		if (op == ValueOpcode::UMin32 &&
 		    (ImmediateU32(inst->Arg(0), immediate) || ImmediateU32(inst->Arg(1), immediate))) {
 			bounds = {0u, immediate, 0u};
@@ -2080,6 +2085,17 @@ private:
 			}
 			if (indirect.key_count.IsEmpty()) {
 				indirect.key_count = BoundedHighBitsImageCount(key);
+			}
+			if (indirect.key_count.IsEmpty()) {
+				const auto* lane = key.Resolve().TryInstruction();
+				const auto guard = PositiveLaneWitness(handle.Parent());
+				U32Bounds bounds;
+				if (lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadLane &&
+				    !guard.IsEmpty() && BoundU32(key, guard, bounds) && bounds.high < 65536u) {
+					// An active lane with an equal bounded local key proves the
+					// range of the key shared by this waterfall iteration.
+					indirect.key_count = Value(bounds.high + 1u);
+				}
 			}
 			if (indirect.key_count.IsEmpty()) {
 				MatchUniformizedMaterialKey(key, handle, indirect, material_source);

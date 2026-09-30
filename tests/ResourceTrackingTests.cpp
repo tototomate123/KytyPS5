@@ -1763,26 +1763,54 @@ void TestGuardedDirectImageTable() {
         "batched descriptor read crossed the 48-bit endpoint");
 }
 
-void TestExpandedImageTables() {
+void TestExpandedImageTables(bool lane_selected = false, bool active_guard = true,
+                             bool equal_key = true) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture;
   auto *entry = fixture.block;
+  auto *header = fixture.AddBlock();
   auto *body = fixture.AddBlock();
   auto *exit = fixture.AddBlock();
-  entry->AddBranch(body);
-  entry->AddBranch(exit);
+  entry->AddBranch(header);
+  header->AddBranch(body);
+  header->AddBranch(exit);
+  body->AddBranch(header);
   body->AddBranch(exit);
   const auto mask = fixture.UserData(2);
-  fixture.program.block_info[0].condition = fixture.Emit(
+  fixture.program.block_info[1].condition = fixture.Emit(
       ValueOpcode::INotEqual32, {mask, Value(0u)});
   fixture.program.block_info[0].terminator = {
-      .kind = CFG::TerminatorKind::ConditionalBranch,
-      .true_block = 1u, .false_block = 2u};
+      .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
   fixture.program.block_info[1].terminator = {
-      .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
-  fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 2u, .false_block = 3u};
+  fixture.program.block_info[2].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 1u, .false_block = 3u};
+  fixture.program.block_info[2].condition = Value(false);
+  fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
   const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
-  const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask}, 0, body);
+  auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask}, 0, body);
+  const uint32_t candidates = lane_selected ? 16u : 32u;
+  if (lane_selected) {
+    const auto active = fixture.Emit(ValueOpcode::INotEqual32, {mask, Value(0u)}, 0, entry);
+    const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                     {mask, Value(15u)}, 0, entry);
+    const auto local = fixture.Emit(ValueOpcode::SelectU32,
+                                     {active, masked, fixture.UserData(3)}, 0, entry);
+    key = fixture.Emit(ValueOpcode::ReadLane, {local, Value(0u)}, 0, header);
+    const auto extra = fixture.Emit(ValueOpcode::INotEqual32,
+                                    {fixture.UserData(5), Value(0u)}, 0, entry);
+    const auto initial = fixture.Emit(ValueOpcode::LogicalAnd, {active, extra}, 0, entry);
+    auto &invariant = header->AppendNewInst(ValueOpcode::Phi, {},
+                                            static_cast<uint64_t>(Type::U1));
+    invariant.AddPhiOperand(entry, initial);
+    invariant.AddPhiOperand(body, Value(&invariant));
+    const auto equal = fixture.Emit(ValueOpcode::IEqual32,
+        {key, equal_key ? local : fixture.UserData(4)}, 0, header);
+    fixture.program.block_info[1].condition = active_guard ? fixture.Emit(
+        ValueOpcode::LogicalAnd, {Value(&invariant), equal}, 0, header) : equal;
+  }
   fixture.block = body;
   const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
   for (uint32_t family = 0; family < 3u; ++family) {
@@ -1804,39 +1832,48 @@ void TestExpandedImageTables() {
     fixture.Emit(ValueOpcode::ImageSampleRaw,
         {image, sampler, fixture.ImageAddress()}, fixture.AddMemory(memory, 0x40));
   }
+  if (lane_selected && (!active_guard || !equal_key)) {
+    CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+               "masked lane key without the active equal-key witness was accepted");
+    return;
+  }
   fixture.PlanAndTrack();
   Check(fixture.program.info.images.size() == 3u, "expanded fixture lost guest table roots");
   const auto plan = ExtractResourcePlan(fixture.program);
   LinearTestMemory memory;
-  for (uint32_t i = 0; i < 96u; ++i) {
-    memory.words[i * 8u] = 0x100u + i;
-    memory.words[i * 8u + 1u] = static_cast<uint32_t>(
-        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
-    memory.words[i * 8u + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
-        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (uint32_t family = 0; family < 3u; ++family) {
+    for (uint32_t candidate = 0; candidate < candidates; ++candidate) {
+      const auto i = family * 32u + candidate;
+      memory.words[i * 8u] = 0x100u + i;
+      memory.words[i * 8u + 1u] = static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+      memory.words[i * 8u + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    }
   }
-  std::array<uint32_t, 3> user_data{0x1000u, 0u, 1u};
+  std::array<uint32_t, 6> user_data{0x1000u, 0u, 1u, 0u, 0u, 1u};
   const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
                            .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 96u && specialization.images.size() == 96u,
+            snapshot.images.size() == 3u * candidates &&
+            specialization.images.size() == 3u * candidates,
         "indirect expansion inherited the guest image slot limit");
   const auto first_specialization = specialization;
-  memory.words[95u * 8u] = 0x999u;
+  memory.words[(64u + candidates - 1u) * 8u] = 0x999u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             first_specialization == specialization && snapshot.images.back().dwords[0] == 0x999u,
         "expanded image refresh changed shader layout or kept a stale descriptor");
   ApplyResourceSpecialization(fixture.program, specialization);
   for (uint32_t root = 0; root < 3u; ++root) {
     const auto &image = fixture.program.info.images[root];
-    Check(image.indirect_resources.size() == 32u && image.indirect_resources[0] == root,
+    Check(image.indirect_resources.size() == candidates && image.indirect_resources[0] == root,
           "expanded table lost candidate ordinals");
     const auto offset = image.indirect_mapping_offset;
-    Check(snapshot.flattened_srt[offset] == 32u &&
-              snapshot.flattened_srt[offset + 63u] == 31u &&
-              snapshot.flattened_srt[offset + 64u] == 31u,
+    Check(snapshot.flattened_srt[offset] == candidates &&
+              snapshot.flattened_srt[offset + candidates * 2u - 1u] == candidates - 1u &&
+              snapshot.flattened_srt[offset + candidates * 2u] == candidates - 1u,
           "expanded table key mapping is inconsistent with its resources");
   }
   ShaderComputeInputInfo compute{};
@@ -1845,8 +1882,8 @@ void TestExpandedImageTables() {
   AllocateBindings(fixture.program);
   const auto *binding = FindBinding(fixture.program.bindings,
                                      *DescriptorBindingForImage(fixture.program.info.images[0]));
-  Check(binding && binding->resources.size() == 96u &&
-            fixture.program.info.sampled_pairs.size() == 96u,
+  Check(binding && binding->resources.size() == 3u * candidates &&
+            fixture.program.info.sampled_pairs.size() == 3u * candidates,
         "expanded image bindings or sampled pairs were truncated");
 }
 
@@ -4298,7 +4335,12 @@ int main() {
     Run("clamped high-bits image table", [] { TestStridedHighBitsImageTable(1u); });
     Run("reversed clamped image table", [] { TestStridedHighBitsImageTable(2u); });
     Run("guarded direct image table", TestGuardedDirectImageTable);
-    Run("expanded image tables", TestExpandedImageTables);
+    Run("expanded image tables", [] { TestExpandedImageTables(); });
+    Run("masked lane image tables", [] {
+      TestExpandedImageTables(true);
+      TestExpandedImageTables(true, false);
+      TestExpandedImageTables(true, true, false);
+    });
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);

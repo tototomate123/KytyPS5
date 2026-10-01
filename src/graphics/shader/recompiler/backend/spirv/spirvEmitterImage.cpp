@@ -355,7 +355,8 @@ uint32_t InverseSwizzle(uint32_t swizzle, uint32_t component) {
 Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
                                                const IR::MemoryInfo& mem) {
 	const auto format = state.program.info.images[mem.resource].conversion_format;
-	if (format == Prospero::BufferFormat::kInvalid) return {};
+	if (format == Prospero::BufferFormat::kInvalid || format == Prospero::BufferFormat::k16UScaled)
+		return {};
 	const auto info = Format::GetFormatInfo(format);
 	EXIT_IF(Prospero::SampledTextureNumericClass(format) != Prospero::TextureNumericClass::Uint ||
 	        Prospero::RemapTextureFormat(format) == format ||
@@ -366,6 +367,31 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 }
 
 uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
+	const auto& image = ctx.state.program.info.images[mem.resource];
+	if (image.conversion_format == Prospero::BufferFormat::k16UScaled) {
+		auto&      state = ctx.state;
+		const auto red   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), red, texel, 0u);
+		const auto scaled      = Binary(state, spv::OpFMul, TypeF32(state), red,
+		                                ConstantF32(state, 0x477fff00u)); // 65535.0f
+		uint32_t   channels[4] = {scaled};
+		for (uint32_t component = 1; component < 4u; ++component) {
+			channels[component] = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), channels[component],
+			                          texel, component);
+		}
+		uint32_t selected[4] {};
+		for (uint32_t component = 0; component < 4u; ++component) {
+			const auto selector = (image.shader_swizzle >> (component * 3u)) & 7u;
+			selected[component] = selector >= 4u   ? channels[selector - 4u]
+			                      : selector == 1u ? ConstantF32(state, 0x3f800000u)
+			                                       : ZeroF32(state);
+		}
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), result,
+		                          selected[0], selected[1], selected[2], selected[3]);
+		return result;
+	}
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
 
@@ -403,6 +429,21 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 }
 
 uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t gathered) {
+	const auto& image = ctx.state.program.info.images[mem.resource];
+	if (image.conversion_format == Prospero::BufferFormat::k16UScaled) {
+		auto&      state    = ctx.state;
+		const auto selector = (image.shader_swizzle >> (ImageGatherComponent(mem.dmask) * 3u)) & 7u;
+		if (selector == 4u) {
+			const auto result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpVectorTimesScalar, TypeF32Vector(state, 4), result,
+			                          gathered, ConstantF32(state, 0x477fff00u));
+			return result;
+		}
+		const auto value =
+		    selector == 1u || selector == 7u ? ConstantF32(state, 0x3f800000u) : ZeroF32(state);
+		return state.builder.Constant(spv::OpConstantComposite, TypeF32Vector(state, 4), value,
+		                              value, value, value);
+	}
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return gathered;
 
@@ -453,11 +494,11 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	const auto sampled     = MakeSampledImage(state, mem.resource, mem.sampler);
 	const auto vector_type = ImageVectorType(state, numeric_class, 4);
 	const auto scalar_type = ImageScalarType(state, numeric_class);
-	const auto component =
-	    ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
-	        ? ImageGatherComponent(mem.dmask)
-	        : 0u;
-	uint32_t values[2] {};
+	const auto component   = state.program.info.images[mem.resource].conversion_format ==
+	                                 Prospero::BufferFormat::kInvalid
+	                             ? ImageGatherComponent(mem.dmask)
+	                             : 0u;
+	uint32_t   values[2] {};
 	for (uint32_t index = 0; index < 2u; index++) {
 		const auto sample_coord =
 		    Binary(state, spv::OpFDiv, TypeF32(state),
@@ -504,13 +545,13 @@ uint32_t EmitThreeDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInf
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), origin[axis], GlslStd450(state),
 		                          GLSLstd450Floor, texel);
 	}
-	const auto sampled     = MakeSampledImage(state, mem.resource, mem.sampler);
-	const auto vector_type = ImageVectorType(state, numeric_class, 4);
-	const auto scalar_type = ImageScalarType(state, numeric_class);
-	const auto component =
-	    ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
-	        ? ImageGatherComponent(mem.dmask)
-	        : 0u;
+	const auto         sampled     = MakeSampledImage(state, mem.resource, mem.sampler);
+	const auto         vector_type = ImageVectorType(state, numeric_class, 4);
+	const auto         scalar_type = ImageScalarType(state, numeric_class);
+	const auto         component   = state.program.info.images[mem.resource].conversion_format ==
+	                                         Prospero::BufferFormat::kInvalid
+	                                     ? ImageGatherComponent(mem.dmask)
+	                                     : 0u;
 	constexpr uint32_t offsets[4][2] {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
 	uint32_t           values[4] {};
 	for (uint32_t index = 0; index < 4u; ++index) {
@@ -901,7 +942,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					         dref_value};
 				} else {
 					uint32_t component = 0;
-					if (ImageConversionFormat(state, candidate_memory).format ==
+					if (state.program.info.images[resource].conversion_format ==
 					    Prospero::BufferFormat::kInvalid) {
 						component = ImageGatherComponent(mem.dmask);
 					}
@@ -942,11 +983,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		} else if (dref) {
 			opcode = spv::OpImageSampleDrefImplicitLod;
 		}
-		uint32_t result_type = ImageVectorType(state, numeric_class, 4);
-		uint32_t dref_value  = 0;
+		uint32_t dref_value = 0;
 		if (dref) {
-			result_type = TypeF32(state);
-			dref_value  = ZeroF32(state);
+			dref_value = ZeroF32(state);
 			if (layout.dref != NoImageComponent) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
@@ -971,15 +1010,35 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource) {
+			auto candidate_memory     = mem;
+			candidate_memory.resource = resource;
+			if (resource != mem.resource) {
+				const auto source = state.program.info.samplers[mem.sampler].source;
+				const auto pair =
+				    std::ranges::find_if(state.program.info.sampled_pairs, [&](const auto& pair) {
+					    return pair.image == resource &&
+					           state.program.info.samplers[pair.sampler].source == source;
+				    });
+				if (pair == state.program.info.sampled_pairs.end()) {
+					if (state.program.info.images[resource].numeric_class != image.numeric_class) {
+						ctx.Fail(inst, "has no indirect sample candidate sampler");
+						return uint32_t {0};
+					}
+				} else {
+					candidate_memory.sampler = pair->sampler;
+				}
+			}
 			// The instruction defines the supplied coordinates, independently of candidate order.
 			const auto& candidate = state.program.info.images[resource];
 			const auto  coord     = CoordF32(
 			    ctx, mem, *address, layout.coord,
 			    ImageDimensionInfoFor(candidate.dimension).coordinate_components, candidate.cube,
 			    ImageDimensionInfoFor(mem.image_dimension).coordinate_components);
-			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
-			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
+			const auto sampled = MakeSampledImage(state, resource, candidate_memory.sampler);
+			const auto sample  = state.builder.AllocateId();
+			const auto candidate_type =
+			    dref ? TypeF32(state) : ImageVectorType(state, candidate.numeric_class, 4);
+			std::vector<uint32_t> sample_operands {candidate_type, sample, sampled, coord};
 			if (dref) {
 				sample_operands.push_back(dref_value);
 			}
@@ -988,6 +1047,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
 			}
 			state.builder.AddFunction(opcode, sample_operands);
+			if (image.indirect_root == mem.resource) {
+				return ResultVector(ctx,
+				                    dref ? sample : UnpackImageTexel(ctx, candidate_memory, sample),
+				                    candidate.numeric_class, dref, candidate_memory);
+			}
 			return sample;
 		};
 		if (image.indirect_root != mem.resource) {
@@ -999,42 +1063,38 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 			return;
 		}
-		auto result = EmitImageCandidateSwitch(ctx, inst, mem, result_type, EmitSample);
+		auto result = EmitImageCandidateSwitch(ctx, inst, mem, TypeU32Vector(state, 4), EmitSample);
 		if (result == 0u) return;
-		if (!dref) {
-			result = UnpackImageTexel(ctx, mem, result);
-		}
-		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+		ctx.Define(inst, result);
 		return;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (image_info.access == IR::ImageAccess::Atomic) {
 		const auto dimension = image.dimension;
-		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
-			           const auto pointer      = state.builder.AllocateId();
-			           const auto pointer_type = state.builder.Type(
-			               spv::OpTypePointer, spv::StorageClassImage, TypeU32(state));
-			           state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
-			                                     StorageImageDescriptorPointer(state, mem.resource),
-			                                     CoordU32(ctx, mem, *address, dimension),
-			                                     ConstantU32(state, 0));
-			           if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
-			               op == IR::ValueOpcode::ImageAtomicFMax32) {
-				           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,
-				                               [&](uint32_t old) {
-					                               return EmitFloatAtomicReplacement(
-					                                   state, old, ctx.Arg(inst, 2),
-					                                   op == IR::ValueOpcode::ImageAtomicFMax32);
-				                               });
-			           }
-			           const auto old = state.builder.AllocateId();
-			           state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
-			                                     ConstantU32(state, spv::ScopeDevice),
-			                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
-			                                     ctx.Arg(inst, 2));
-			           EmitDeviceAtomicMemoryBarrier(state);
-			           return old;
-		           }));
+		ctx.Define(
+		    inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+			    const auto pointer = state.builder.AllocateId();
+			    const auto pointer_type =
+			        state.builder.Type(spv::OpTypePointer, spv::StorageClassImage, TypeU32(state));
+			    state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
+			                              StorageImageDescriptorPointer(state, mem.resource),
+			                              CoordU32(ctx, mem, *address, dimension),
+			                              ConstantU32(state, 0));
+			    if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
+			        op == IR::ValueOpcode::ImageAtomicFMax32) {
+				    return AtomicUpdate(state, pointer, IR::ResourceKind::Image, [&](uint32_t old) {
+					    return EmitFloatAtomicReplacement(state, old, ctx.Arg(inst, 2),
+					                                      op == IR::ValueOpcode::ImageAtomicFMax32);
+				    });
+			    }
+			    const auto old = state.builder.AllocateId();
+			    state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
+			                              ConstantU32(state, spv::ScopeDevice),
+			                              ConstantU32(state, spv::MemorySemanticsMaskNone),
+			                              ctx.Arg(inst, 2));
+			    EmitDeviceAtomicMemoryBarrier(state);
+			    return old;
+		    }));
 		return;
 	}
 	ctx.Fail(inst, "has no image SPIR-V emitter");

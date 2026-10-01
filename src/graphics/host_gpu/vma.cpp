@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -39,7 +40,7 @@ bool GraphicContext::CreateAllocator() {
 	info.device           = device;
 	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
-	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+	info.flags            = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
@@ -60,7 +61,7 @@ void GraphicContext::DestroyAllocator() {
 	allocator = nullptr;
 }
 
-void GraphicContext::LogMemoryBudget() const {
+void GraphicContext::LogMemoryBudget(bool diagnostic) const {
 	if (allocator == nullptr || physical_device == nullptr) {
 		return;
 	}
@@ -69,6 +70,24 @@ void GraphicContext::LogMemoryBudget() const {
 	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
+		if (diagnostic) {
+			const auto usage        = static_cast<uint64_t>(budgets[i].usage);
+			const auto budget       = static_cast<uint64_t>(budgets[i].budget);
+			const auto headroom     = budget > usage ? budget - usage : uint64_t {0};
+			const bool device_local = static_cast<bool>(properties.memoryHeaps[i].flags &
+			                                            vk::MemoryHeapFlagBits::eDeviceLocal);
+			std::fprintf(
+			    stderr,
+			    "HFW VMA heap %u: usage=%" PRIu64 ", budget=%" PRIu64 ", allocation=%" PRIu64
+			    ", blocks=%" PRIu64 ", headroom=%" PRIu64 ", used=%.1f%%, device_local=%u\n",
+			    i, static_cast<uint64_t>(budgets[i].usage),
+			    static_cast<uint64_t>(budgets[i].budget),
+			    static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
+			    static_cast<uint64_t>(budgets[i].statistics.blockBytes), headroom,
+			    budget != 0 ? 100.0 * static_cast<double>(usage) / static_cast<double>(budget)
+			                : 0.0,
+			    static_cast<unsigned>(device_local));
+		}
 		LOGF("VMA heap %u: usage=%" PRIu64 ", budget=%" PRIu64 ", allocation=%" PRIu64
 		     ", blocks=%" PRIu64 "\n",
 		     i, static_cast<uint64_t>(budgets[i].usage), static_cast<uint64_t>(budgets[i].budget),
@@ -136,7 +155,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	const auto       result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
 	image.image = native_image;

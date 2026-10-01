@@ -45,8 +45,8 @@ struct ImageSubresourceRange {
 };
 
 struct ImageMipInfo {
-	uint64_t offset                                 = 0;
-	uint64_t size                                   = 0;
+	uint64_t offset = 0;
+	uint64_t size   = 0;
 	// Padded dimensions in storage elements (compressed blocks for BC formats).
 	uint32_t pitch                                  = 0;
 	uint32_t height                                 = 0;
@@ -105,12 +105,12 @@ struct ImageInfo {
 		return -1;
 	}
 	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
-		if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
-		    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
-		    container.resources.layers == 0 || mip < 0 ||
+		if (!IsCompatible(container) || tile_mode != container.tile_mode ||
+		    type != container.type || IsVolume() || resources.levels != 1 ||
+		    resources.layers == 0 || container.resources.layers == 0 || mip < 0 ||
 		    static_cast<uint32_t>(mip) >= container.resources.levels ||
-		    container.resources.levels > container.mip_layout.size() ||
-		    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
+		    container.resources.levels > container.mip_layout.size() || !data.Valid() ||
+		    !container.data.Valid() || data.address < container.data.address ||
 		    data.End() > container.data.End()) {
 			return -1;
 		}
@@ -208,6 +208,9 @@ FindDepthFormatPolicy(Prospero::DepthFormat depth_format) noexcept {
 
 [[nodiscard]] inline constexpr const DepthFormatPolicy*
 FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
+	if (guest_format == Prospero::BufferFormat::k32FloatClamp) {
+		guest_format = Prospero::BufferFormat::k32Float;
+	}
 	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
 		if (policy.guest_format == guest_format) {
 			return &policy;

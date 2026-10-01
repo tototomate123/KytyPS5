@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <optional>
 
@@ -388,13 +389,21 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+		static std::atomic<int64_t> last_report {0};
+		const auto                  now = std::chrono::duration_cast<std::chrono::seconds>(
+		                                      std::chrono::steady_clock::now().time_since_epoch())
+		                                      .count();
+		if (last_report.exchange(now, std::memory_order_relaxed) != now)
+			graphics.LogMemoryBudget(true);
 		std::fprintf(stderr,
 		             "HFW GPU submit: tick=%" PRIu64 " op=%u submit=%" PRIu64
-		             " args=%u,%u,%u,%u,0x%016" PRIx64 " gpu=%" PRIu64 "\n",
+		             " args=%u,%u,%u,%u,0x%016" PRIx64 " gpu=%" PRIu64 " waits=%u(%" PRIu64
+		             ",%" PRIu64 ",%" PRIu64 ")\n",
 		             tick, m_command.m_debug_op, m_command.m_debug_submit_id,
 		             m_command.m_debug_arg0, m_command.m_debug_arg1, m_command.m_debug_arg2,
-		             m_command.m_debug_arg3, m_command.m_debug_arg4,
-		             m_master.KnownGpuTick());
+		             m_command.m_debug_arg3, m_command.m_debug_arg4, m_master.KnownGpuTick(),
+		             submit.num_wait_semaphores, submit.wait_ticks[0], submit.wait_ticks[1],
+		             submit.wait_ticks[2]);
 	}
 
 	m_command.m_buffer = nullptr;

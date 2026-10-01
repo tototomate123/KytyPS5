@@ -739,6 +739,30 @@ void TestInvariantIndirectImageMaterialization() {
   }
   array_fixture->PlanAndTrack();
   auto array_plan = ExtractResourcePlan(array_fixture->program);
+  Check(array_plan.info.images[0].level_zero_only &&
+            !volume_plan.info.images[0].level_zero_only,
+        "mip-zero-only classification did not distinguish LZ and general sampling");
+  auto mixed_lod_fixture = MakeIndirectImageFixture(false);
+  Inst *sample_inst = nullptr;
+  for (auto &inst : *mixed_lod_fixture->block) {
+    if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) sample_inst = &inst;
+  }
+  Check(sample_inst != nullptr, "mixed-LOD fixture has no sample");
+  mixed_lod_fixture->program.memory_info[sample_inst->Flags<MemoryFlags>().index]
+      .image_sample_flags = Decoder::ImageSampleFlagLevelZero;
+  MemoryInfo general_sample;
+  general_sample.kind = ResourceKind::Image;
+  general_sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto general = mixed_lod_fixture->Emit(
+      ValueOpcode::ImageSampleRaw,
+      {sample_inst->Arg(0), sample_inst->Arg(1), sample_inst->Arg(2)},
+      mixed_lod_fixture->AddMemory(general_sample, 0x10f4));
+  mixed_lod_fixture->Emit(ValueOpcode::ReferenceU32,
+      {mixed_lod_fixture->Emit(ValueOpcode::CompositeExtractU32x4, {general, Value(0u)})});
+  mixed_lod_fixture->PlanAndTrack();
+  Check(mixed_lod_fixture->program.info.images.size() == 1 &&
+            !mixed_lod_fixture->program.info.images[0].level_zero_only,
+        "general sample merged into an LZ resource retained mip-zero-only classification");
   const auto first_image = (0x2000u - memory.base) / 4u;
   memory.words[first_image + 3u] =
       Libs::Graphics::DstSel(4, 5, 6, 7) |
@@ -749,6 +773,43 @@ void TestInvariantIndirectImageMaterialization() {
             mixed_specialization.images[0].dimension == Decoder::ImageDimension::Dim2DArray &&
             mixed_specialization.images[1].dimension == Decoder::ImageDimension::Dim3D,
         "array sampling rejected a mixed array/volume texture table");
+  const auto saved_candidate = std::array<uint32_t, 8>{
+      memory.words[second_image], memory.words[second_image + 1u],
+      memory.words[second_image + 2u], memory.words[second_image + 3u],
+      memory.words[second_image + 4u], memory.words[second_image + 5u],
+      memory.words[second_image + 6u], memory.words[second_image + 7u]};
+  constexpr std::array<uint32_t, 8> hfw_invalid_candidate{
+      0xc0012600u, 0x40ec8400u, 0x00000803u, 0xc0033500u,
+      0x00000030u, 0u, 0x00000030u, 0u};
+  std::copy(hfw_invalid_candidate.begin(), hfw_invalid_candidate.end(),
+            memory.words.begin() + second_image);
+  Check(MaterializeResources(array_plan, runtime, mixed_snapshot, mixed_specialization) &&
+            std::ranges::all_of(mixed_snapshot.images[1].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "HFW reserved-selector table candidate was retained as a 1D texture");
+  std::copy(saved_candidate.begin(), saved_candidate.end(), memory.words.begin() + second_image);
+  memory.words[second_image + 1u] = 9u << 20u;
+  memory.words[second_image + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  Check(MaterializeResources(array_plan, runtime, mixed_snapshot, mixed_specialization) &&
+            mixed_specialization.images[1].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Float &&
+            mixed_specialization.images[1].conversion_format ==
+                Libs::Graphics::Prospero::BufferFormat::k16UScaled,
+        "native/scaled float table did not preserve candidate-specific conversion");
+  memory.words[second_image + 1u] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32UInt) << 20u;
+  memory.words[second_image + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  Check(MaterializeResources(array_plan, runtime, mixed_snapshot, mixed_specialization) &&
+            mixed_specialization.images[0].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Float &&
+            mixed_specialization.images[1].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Uint,
+        "mip-zero sample rejected mixed float and integer candidates");
+  memory.words[second_image + 1u] = image_descriptor[1];
+  memory.words[second_image + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor3D) << 28u);
   array_plan.info.images[0].simple_2d_3d_sampling = false;
   Check(!MaterializeResources(array_plan, runtime, mixed_snapshot,
                               mixed_specialization),
@@ -1461,12 +1522,13 @@ void TestIndirectFormattedBuffer(uint32_t components) {
   formatted.data_bits = 32u;
   formatted.data_dwords = components;
   const auto flags = fixture.AddMemory(formatted, 0x44);
-  const auto loaded = fixture.Emit(components == 2u ? ValueOpcode::LoadBufferU32x2
+  const auto loaded = fixture.Emit(components == 1u ? ValueOpcode::LoadBufferU32
+                                   : components == 2u ? ValueOpcode::LoadBufferU32x2
                                    : components == 3u ? ValueOpcode::LoadBufferU32x3
                                                       : ValueOpcode::LoadBufferU32x4,
                                     {buffer, fixture.UserData(2), Value(0u), Value(0u),
                                      Value(true)}, flags);
-  const auto component = fixture.Emit(components == 2u
+  const auto component = components == 1u ? loaded : fixture.Emit(components == 2u
                                           ? ValueOpcode::CompositeExtractU32x2
                                     : components == 3u
                                           ? ValueOpcode::CompositeExtractU32x3
@@ -2821,6 +2883,16 @@ void TestImageDescriptorFields() {
               snapshot.images[0].dwords == user_data,
           "valid texture descriptor was rejected");
     const auto valid_descriptor = user_data;
+    for (uint32_t component = 0; component < 4u; ++component) {
+      for (uint32_t selector : {2u, 3u}) {
+        user_data = valid_descriptor;
+        user_data[3] = (user_data[3] & ~(7u << (component * 3u))) |
+                       (selector << (component * 3u));
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) && is_null(),
+              "reserved texture component selector was accepted");
+      }
+    }
+    user_data = valid_descriptor;
     // Keep RESOURCE_LEVEL set in this valid texture descriptor.
     user_data = {0x0208a200u, 0xca900000u, 0x800fc00fu, 0x90960facu,
                  0u, 0x60u, 0u, 0u};
@@ -3708,6 +3780,7 @@ void TestPhiValidation() {
                                    MemoryFlags{0, 20}, merge);
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;
+  memory.typed = true; // Typed loads still require a host-evaluable descriptor.
   fixture.Emit(ValueOpcode::LoadBufferU32,
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
@@ -4573,6 +4646,7 @@ int main() {
     Run("bounded address image keys", TestBoundedAddressImageKeys);
     Run("lane-selected address image keys", TestLaneSelectedAddressImageKeys);
     Run("buffer record image key", TestBufferRecordImageKey);
+    Run("indirect formatted X buffer", [] { TestIndirectFormattedBuffer(1u); });
     Run("indirect formatted XY buffer", [] { TestIndirectFormattedBuffer(2u); });
     Run("indirect formatted XYZ buffer", [] { TestIndirectFormattedBuffer(3u); });
     Run("indirect formatted XYZW buffer", [] { TestIndirectFormattedBuffer(4u); });

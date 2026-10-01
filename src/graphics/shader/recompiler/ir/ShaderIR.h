@@ -76,13 +76,13 @@ struct MemoryInfo {
 			// A dynamic buffer descriptor can be read directly when each XY(ZW)
 			// component occupies one complete DWORD. The emitter checks the
 			// runtime format and channel order before loading.
-			return (opcode == ValueOpcode::LoadBufferU32x2 && data_dwords == 2u) ||
+			return (opcode == ValueOpcode::LoadBufferU32 && data_dwords == 1u) ||
+			       (opcode == ValueOpcode::LoadBufferU32x2 && data_dwords == 2u) ||
 			       (opcode == ValueOpcode::LoadBufferU32x3 && data_dwords == 3u) ||
 			       (opcode == ValueOpcode::LoadBufferU32x4 && data_dwords == 4u);
 		}
-		return opcode == ValueOpcode::LoadBufferU32x2 ||
-		       opcode == ValueOpcode::LoadBufferU32x3 ||
-		       opcode == ValueOpcode::LoadBufferU32x4;
+		return opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		       opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4;
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -145,6 +145,7 @@ struct ImageResource {
 	bool                          r128              = false;
 	bool                          simple_2d_3d_sampling      = false;
 	bool                          gather_only                = false;
+	bool                          level_zero_only            = false;
 	uint32_t                      indirect_root              = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset    = 0;
 	uint32_t                      indirect_search_iterations = 0;

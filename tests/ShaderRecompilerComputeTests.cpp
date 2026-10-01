@@ -10139,6 +10139,80 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckMipZeroOverwideTexture(bool five_mips = false) {
+    constexpr const char *name = "MipZeroOverwideTexture";
+    constexpr uintptr_t base = 0x0000000204800000ull;
+    constexpr uint64_t size = 0x200000;
+    EnsureRuntimeContext();
+    int64_t offset = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+                0x10000, 0, &offset) == 0, "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base), "mapping failed");
+    std::memset(mapped, 0, size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      ShaderTextureResource captured{{0x03530cc6u, 0xcb100008u, 0x00ffc0ffu,
+          0x901a022cu, 0x00040600u, 0x00040600u, 0u, 5u}};
+      if (five_mips) {
+        captured.fields[0] = 0x0353fabau;
+        captured.fields[4] = captured.fields[5] = 0x00041640u;
+      }
+      const uint32_t physical_levels = five_mips ? 5u : 1u;
+      Require(name, "captured descriptor", captured.LastLevel() == 10 &&
+                  captured.MaxMip() + 1u == physical_levels && captured.Width5() + 1u == 1024 &&
+                  captured.Height5() + 1u == 1024 &&
+                  captured.Format() == Prospero::BufferFormat::kBc5UNorm,
+              "HFW descriptor fixture changed");
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(captured.fields, 8, value.dwords.begin());
+      value.dwords[0] = static_cast<uint32_t>(base >> 8u);
+      value.dwords[1] &= ~0xffu;
+      value.dwords[1] |= static_cast<uint32_t>(base >> 40u);
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      resource.level_zero_only = true;
+      auto &executor = context.GetRenderExecutor();
+      auto &cache = context.GetTextureCache();
+      TileSizeAlign physical_size{};
+      TileGetTextureTotalSize(captured.Format(), 1024, 1024, 1, physical_levels,
+                              captured.TileMode(), false, physical_size);
+      // The streaming descriptor from shader 78c2630927b3666b retains MIN_LOD=15
+      // while the LZ view exposes only mip zero.
+      value.dwords[1] = (value.dwords[1] & ~0xfff00u) | (3840u << 8u);
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "minimum LOD clamp", binding.desc.view_info.min_lod == 0u,
+              "streaming minimum LOD exceeded the single-mip view");
+      Require(name, "physical mip footprint", binding.desc.info.resources.levels == physical_levels &&
+                  binding.desc.view_info.level_count == 1 &&
+                  binding.desc.info.data.size == physical_size.size &&
+                  cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+              "mip-zero sampling extended the captured physical allocation");
+      scheduler.Finish();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(offset, size) == 0,
+            "release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckComparisonDepthTexture() {
     constexpr const char *name = "ComparisonDepthTexture";
     constexpr uintptr_t base = 0x0000000204200000ull;
@@ -10317,6 +10391,47 @@ public:
     };
     check_layout(false);
     check_layout(true);
+    {
+      // Exercise descriptor resolution and upload for the HFW image-only
+      // format, including sharing its backing across comparison modes.
+      std::memset(mapped, 0, allocation_size);
+      const float depth = 0.75f;
+      std::memcpy(mapped, &depth, sizeof(depth));
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      value.dwords[0] = static_cast<uint32_t>(base >> 8u);
+      value.dwords[1] = 140u << 20u;
+      value.dwords[3] = (9u << 28u) | DstSel(4, 4, 4, 4);
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      auto &executor = context.GetRenderExecutor();
+      auto &cache = context.GetTextureCache();
+      const auto ordinary = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "format 140 ordinary depth upload",
+              cache.FindTexture(ordinary.image_id, ordinary.desc) != nullptr &&
+                  cache.GetImage(ordinary.image_id).info.pixel_format == vk::Format::eD32Sfloat,
+              "format 140 failed to create and upload native depth backing");
+      resource.depth_compare = true;
+      const auto comparison = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "format 140 shared comparison backing",
+              comparison.image_id == ordinary.image_id &&
+                  cache.FindTexture(comparison.image_id, comparison.desc) != nullptr,
+              "comparison sampling duplicated format 140 depth backing");
+      scheduler.Finish();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
     Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "comparison texture unmap failed");
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
@@ -11252,14 +11367,14 @@ public:
         AppendStoreVgpr(&lod_test.code, 0, 0);
         AppendEnd(&lod_test.code);
         const auto lod_program = CompileCase(lod_test, SubgroupSize());
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-        ExpectFatal("TextureMinLodBeyondView", [&] {
-          auto invalid_lod = lod_descriptor;
-          invalid_lod.dwords[1] |= 1024u << 8u;
-          (void)RenderExecutorTestAccess::ResolveTexture(
-              executor, lod_program.program.info.images[0], invalid_lod);
-        });
-#endif
+        auto excessive_lod = lod_descriptor;
+        excessive_lod.dwords[1] |= 1024u << 8u;
+        const auto clamped_lod = RenderExecutorTestAccess::ResolveTexture(
+            executor, lod_program.program.info.images[0], excessive_lod);
+        Require(lod_test.name, "minimum LOD range",
+                clamped_lod.desc.view_info.min_lod <=
+                    (clamped_lod.desc.view_info.level_count - 1u) * 256u,
+                "minimum LOD exceeded the resolved view");
         const auto lod_binding = RenderExecutorTestAccess::ResolveTexture(
             executor, lod_program.program.info.images[0], lod_descriptor);
         for (uint32_t mip = 0; mip < 4; ++mip) {
@@ -24777,7 +24892,7 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
-TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
+TestCase BufferLoadsGpuSelectedDescriptors(bool xyz, bool scalar = false) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
@@ -24802,7 +24917,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
       {12, 4, 3, 4, true, true, {}},
   };
   TestCase test;
-  test.name = xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
+  test.name = scalar ? "BufferLoadFormatXGpuSelectedDescriptors" : xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
                   : "BufferLoadsGpuSelectedDescriptors";
   test.initial.resize(2048);
   for (u32 i = 0; i < std::size(cases); ++i) {
@@ -24812,7 +24927,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
     const std::array<u32, 4> descriptor{
         static_cast<u32>(GuestBase + data_offset),
         (input.stride << 16u) | (input.swizzle ? 1u << 31u : 0u) | 1u,
-        input.records, (input.bound ? 0x5204u : 0x204u) | (input.mode << 28u)};
+        input.records, (input.bound ? (scalar ? ((static_cast<u32>(i % 3u == 0u ? Prospero::BufferFormat::k32Float : i % 3u == 1u ? Prospero::BufferFormat::k32_32_32Float : Prospero::BufferFormat::k32_32_32_32Float) << 12u) | 4u) : 0x5204u) : 0x204u) | (input.mode << 28u)};
     std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
     for (u32 word = 0; word < 32; ++word) {
       test.initial[data_offset / 4 + word] = i * 100 + word + 1;
@@ -24829,13 +24944,13 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
     test.code.push_back(EncodeSmem1(520, 20));
     AppendSMovLiteral(&test.code, 22, cases[selected].soffset);
     AppendVMovU32(&test.code, 21, 1);
-    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0e, 0, true, false));
+    test.code.push_back(EncodeMubuf0(scalar ? 0x00 : xyz ? 0x0f : 0x0e, 0, true, false));
     test.code.push_back(EncodeMubuf1(0, 2, 21, 22));
-    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0d, xyz ? 12 : 16, true, false));
-    test.code.push_back(EncodeMubuf1(xyz ? 3 : 4, 2, 21, 22));
-    for (u32 component = 0; component < 6; ++component) {
-      AppendStoreVgpr(&test.code, component, i * 6 + component);
-      const u32 expected = cases[selected].expected[component];
+    test.code.push_back(EncodeMubuf0(scalar ? 0x00 : xyz ? 0x0f : 0x0d, scalar || xyz ? 12 : 16, true, false));
+    test.code.push_back(EncodeMubuf1(scalar ? 1 : xyz ? 3 : 4, 2, 21, 22));
+    for (u32 component = 0; component < (scalar ? 2u : 6u); ++component) {
+      AppendStoreVgpr(&test.code, component, i * (scalar ? 2u : 6u) + component);
+      const u32 expected = cases[selected].expected[scalar ? component * 3u : component];
       test.expected.push_back(expected == 0 ? 0 : selected * 100 + expected);
     }
   }
@@ -24844,13 +24959,19 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  if (xyz) {
+  if (scalar) {
+    test.opcodes.push_back(O::BUFFER_LOAD_FORMAT_X);
+  } else if (xyz) {
     test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
   } else {
     test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
   }
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
   return test;
+}
+
+TestCase BufferLoadFormatXGpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(false, true);
 }
 
 TestCase BufferLoadsGpuSelectedDescriptors() {
@@ -28475,6 +28596,39 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+TestCase ImageScaled16Texture(uint32_t mode) {
+  TestCase test;
+  test.name = mode == 0u ? "ImageScaled16Load" : mode == 1u ?
+      "ImageScaled16Sample" : "ImageScaled16GatherConstant";
+  if (mode == 0u) {
+    AppendVMovU32(&test.code, 20, 2u);
+    AppendVMovU32(&test.code, 21, 1u);
+  } else {
+    AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(0.625f));
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.375f));
+  }
+  test.code.push_back(EncodeMimg0(mode == 0u ? 0x00u : mode == 1u ? 0x27u : 0x47u,
+                                mode == 2u ? 2u : 0xfu));
+  test.code.push_back(EncodeMimg1(0, 20));
+  for (uint32_t i = 0; i < 4u; ++i) AppendStoreVgpr(&test.code, i, i);
+  AppendEnd(&test.code);
+  test.opcodes = {ShaderOpcode::V_MOV_B32, mode == 0u ? ShaderOpcode::IMAGE_LOAD :
+      mode == 1u ? ShaderOpcode::IMAGE_SAMPLE : ShaderOpcode::IMAGE_GATHER4_LZ,
+      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.expected = mode == 2u ? std::vector<u32>(4u, std::bit_cast<u32>(1.f)) :
+      std::vector<u32>{std::bit_cast<u32>(65535.f), std::bit_cast<u32>(1.f),
+                      0u, std::bit_cast<u32>(65535.f)};
+  test.sampled_image_rgba.resize(16u, 0xffffffffu);
+  test.sampled_image_format = vk::Format::eR16Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k16UScaled);
+  test.user_data[3] |= DstSel(4, 1, 0, 4);
+  test.image_descriptor_swizzle = DstSel(4, 1, 0, 4);
+  test.has_user_data = true;
+  test.required_spirv = {"OpTypeImage %float"};
+  return test;
+}
+
 TestCase ImageLoadFmaskUsesNativeSampleMapping() {
   auto test = ImageLoadR32UintUsesIntegerSampledImage();
   test.name = "ImageLoadFmaskUsesNativeSampleMapping";
@@ -29199,6 +29353,14 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   return test;
 }
 
+TestCase ImageSampleFloatClampDepth() {
+  auto test = ImageSampleA16CompareBiasRdna2AddressOrder();
+  test.name = "ImageSampleFloatClampDepth";
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32FloatClamp);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase ImageGatherCompareOpcodes() {
   using O = ShaderOpcode;
 
@@ -29431,6 +29593,20 @@ void CheckIndirectImageKeySwitch() {
                 text.find("OpPhi") != std::string::npos &&
                 text.find("OpBitcast") != std::string::npos,
             "mixed numeric gather did not merge two typed results as raw words");
+    sample.ReplaceOpcode(ValueOpcode::ImageSampleRaw);
+    program.info.images[integer_first ? 0u : 1u].dimension =
+        ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    program.info.images[integer_first ? 1u : 0u].dimension =
+        ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+    program.binding_layout_complete = false;
+    AllocateBindings(program);
+    spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv(name, spirv);
+    Require(name, "mixed sample disassembly", tools.Disassemble(spirv, &text) &&
+                CountText(text, "OpImageSampleExplicitLod") == 2u &&
+                text.find("OpPhi %v4uint") != std::string::npos,
+            "mixed float/uint mip-zero samples did not merge raw register words");
+    sample.ReplaceOpcode(ValueOpcode::ImageGatherRaw);
   }
   sample.ReplaceOpcode(ValueOpcode::ImageSampleRaw);
   program.memory_info[0] = memory;
@@ -30926,6 +31102,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
+  AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
@@ -31043,6 +31220,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  for (uint32_t mode = 0; mode < 3u; ++mode) cases.push_back(ImageScaled16Texture(mode));
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
@@ -31067,6 +31245,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
+  AddCase(ImageSampleFloatClampDepth);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
@@ -32099,6 +32278,18 @@ void CheckSampledColorViews() {
 #endif
 
 void CheckSampledDepthResource() {
+  const auto clamp_format = Prospero::BufferFormat::k32FloatClamp;
+  const auto clamp_surface = TextureGetSurfaceFormatInfo(clamp_format);
+  Require("SampledDepthResource", "format 140 depth backing",
+          static_cast<uint32_t>(clamp_format) == 140u &&
+              Prospero::NumBytesPerElement(clamp_format) == 4u &&
+              Prospero::SampledTextureNumericClass(clamp_format) ==
+                  Prospero::TextureNumericClass::Float &&
+              clamp_surface.vk_format == vk::Format::eD32Sfloat &&
+              clamp_surface.conversion_format == Prospero::BufferFormat::kInvalid &&
+              FindGuestDepthFormatPolicy(clamp_format) ==
+                  FindDepthFormatPolicy(Prospero::DepthFormat::kZ32F),
+          "format 140 did not resolve to native Z32 float depth sampling");
   ShaderRecompiler::IR::ImageResource resource{};
   resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
   resource.numeric_class = Prospero::TextureNumericClass::Float;
@@ -35891,6 +36082,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
@@ -36264,6 +36456,18 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
+    RunCase(nullptr, ImageSampleFloatClampDepth());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scaled-texture-only") == 0) {
+    VulkanHarness vulkan;
+    for (uint32_t mode = 0; mode < 3u; ++mode) RunCase(&vulkan, ImageScaled16Texture(mode));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mip-zero-view-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMipZeroOverwideTexture();
+    vulkan.CheckMipZeroOverwideTexture(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {

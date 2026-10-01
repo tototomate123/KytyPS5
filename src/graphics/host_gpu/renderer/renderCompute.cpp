@@ -204,7 +204,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_z, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
-	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
 		m_context.GetCommandScheduler().Flush();
 	}
 	auto& ctx    = buffer.GetRegisters();
@@ -273,12 +273,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		input_info.dispatch_threads_num[2] = thread_group_z;
 	}
 
-	const auto& program   = *input_info.stage.program;
-	const auto& resources = *input_info.stage.resources;
-	const bool  hfw_target_dispatch =
-	    LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed) &&
-	    thread_group_x == 30 && thread_group_y == 17 && thread_group_z == 1 && mode == 0x41u;
-	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+	const auto& program             = *input_info.stage.program;
+	const auto& resources           = *input_info.stage.resources;
+	const bool  hfw_target_dispatch = LoadDiagnostics::HfwGpuTickTraceEnabled() &&
+	                                  thread_group_x == 30 && thread_group_y == 17 &&
+	                                  thread_group_z == 1 && mode == 0x41u;
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
 		std::fprintf(stderr,
 		             "HFW GPU compute shader: tick=%" PRIu64 " submit=%" PRIu64
 		             " hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " groups=%ux%ux%u"
@@ -441,7 +441,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
-	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
 		m_context.GetCommandScheduler().Flush();
 	}
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,

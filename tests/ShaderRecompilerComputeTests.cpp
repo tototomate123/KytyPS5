@@ -10139,8 +10139,8 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckMipZeroOverwideTexture(bool five_mips = false) {
-    constexpr const char *name = "MipZeroOverwideTexture";
+  void CheckMipZeroOverwideTexture(bool five_mips = false, bool packed = false) {
+    const char *name = packed ? "PackedImageAtomicViews" : "MipZeroOverwideTexture";
     constexpr uintptr_t base = 0x0000000204800000ull;
     constexpr uint64_t size = 0x200000;
     EnsureRuntimeContext();
@@ -10167,11 +10167,17 @@ public:
         captured.fields[0] = 0x0353fabau;
         captured.fields[4] = captured.fields[5] = 0x00041640u;
       }
+      if (packed) {
+        captured.fields[1] = static_cast<u32>(Prospero::BufferFormat::k11_11_10Float) << 20u;
+        captured.fields[2] = 3u | (3u << 14u);
+        captured.fields[3] = (captured.fields[3] & ~0xfff00u) | DstSel(4, 5, 6, 7);
+        captured.fields[4] = captured.fields[5] = 0;
+      }
       const uint32_t physical_levels = five_mips ? 5u : 1u;
-      Require(name, "captured descriptor", captured.LastLevel() == 10 &&
+      Require(name, "captured descriptor", packed || (captured.LastLevel() == 10 &&
                   captured.MaxMip() + 1u == physical_levels && captured.Width5() + 1u == 1024 &&
                   captured.Height5() + 1u == 1024 &&
-                  captured.Format() == Prospero::BufferFormat::kBc5UNorm,
+                  captured.Format() == Prospero::BufferFormat::kBc5UNorm),
               "HFW descriptor fixture changed");
       ShaderRecompiler::IR::DescriptorValue value{};
       value.dword_count = 8;
@@ -10181,18 +10187,19 @@ public:
       value.dwords[1] |= static_cast<uint32_t>(base >> 40u);
       ShaderRecompiler::IR::ImageResource resource{};
       resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
-      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.packed = packed;
+      resource.numeric_class = packed ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float;
       resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       resource.read = true;
       resource.level_zero_only = true;
       auto &executor = context.GetRenderExecutor();
       auto &cache = context.GetTextureCache();
       TileSizeAlign physical_size{};
-      TileGetTextureTotalSize(captured.Format(), 1024, 1024, 1, physical_levels,
+      TileGetTextureTotalSize(captured.Format(), captured.Width5() + 1u, captured.Height5() + 1u, 1, physical_levels,
                               captured.TileMode(), false, physical_size);
       // The streaming descriptor from shader 78c2630927b3666b retains MIN_LOD=15
       // while the LZ view exposes only mip zero.
-      value.dwords[1] = (value.dwords[1] & ~0xfff00u) | (3840u << 8u);
+      value.dwords[1] = (value.dwords[1] & ~0xfff00u) | ((packed ? 0u : 3840u) << 8u);
       const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
       Require(name, "minimum LOD clamp", binding.desc.view_info.min_lod == 0u,
               "streaming minimum LOD exceeded the single-mip view");
@@ -10201,6 +10208,17 @@ public:
                   binding.desc.info.data.size == physical_size.size &&
                   cache.FindTexture(binding.image_id, binding.desc) != nullptr,
               "mip-zero sampling extended the captured physical allocation");
+      if (packed) {
+        Require(name, "raw sampled view", binding.desc.view_info.format == vk::Format::eR32Uint,
+                "packed load view converted the texel format");
+        resource.packed = false;
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+        resource.atomic = resource.written = true;
+        const auto atomic = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        Require(name, "atomic alias", atomic.desc.view_info.format == vk::Format::eR32Uint &&
+                    atomic.image_id == binding.image_id,
+                "packed load and atomic views did not share the same image");
+      }
       scheduler.Finish();
       RenderExecutorTestAccess::ResetBindings(executor);
       context.UnmapMemory(base, size);
@@ -28596,6 +28614,50 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+TestCase ImageLoadPackedPreservesBits() {
+  auto test = ImageLoadR32UintUsesIntegerSampledImage();
+  test.name = "ImageLoadPackedPreservesBits";
+  test.code.clear();
+  AppendVMovU32(&test.code, 20, 2);
+  AppendVMovU32(&test.code, 21, 1);
+  test.code.push_back(EncodeMimg0(0x02, 1));
+  test.code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendEnd(&test.code);
+  test.opcodes[1] = ShaderOpcode::IMAGE_LOAD_PCK;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k11_11_10Float);
+  return test;
+}
+
+TestCase ImageCompareSwapPackedBits() {
+  TestCase test;
+  test.name = "ImageCompareSwapPackedBits";
+  AppendVMovU32(&test.code, 20, 2);
+  AppendVMovU32(&test.code, 21, 1);
+  AppendVMovLiteral(&test.code, 0, 0x12345678u);
+  AppendVMovLiteral(&test.code, 1, 0xdeadbeefu);
+  test.code.push_back(EncodeMimg0(0x10, 3, 0, true));
+  test.code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendVMovLiteral(&test.code, 0, 0x87654321u);
+  AppendVMovLiteral(&test.code, 1, 0xdeadbeefu); // Mismatch must leave the texel unchanged.
+  test.code.push_back(EncodeMimg0(0x10, 3, 0, true));
+  test.code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&test.code, 0, 1);
+  AppendEnd(&test.code);
+  test.expected = {0xdeadbeefu, 0x12345678u};
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_ATOMIC_CMPSWAP,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k11_11_10Float);
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.storage_image_r32ui[6] = 0xdeadbeefu;
+  test.expected_storage_image_r32ui = test.storage_image_r32ui;
+  test.expected_storage_image_r32ui[6] = 0x12345678u;
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer"};
+  return test;
+}
+
 TestCase ImageScaled16Texture(uint32_t mode) {
   TestCase test;
   test.name = mode == 0u ? "ImageScaled16Load" : mode == 1u ?
@@ -31219,6 +31281,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxSpecialValues);
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
+  AddCase(ImageLoadPackedPreservesBits);
+  AddCase(ImageCompareSwapPackedBits);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
   for (uint32_t mode = 0; mode < 3u; ++mode) cases.push_back(ImageScaled16Texture(mode));
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
@@ -36457,6 +36521,14 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     RunCase(nullptr, ImageSampleFloatClampDepth());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--packed-image-atomic-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMipZeroOverwideTexture(false, true);
+    RunCase(&vulkan, ImageLoadPackedPreservesBits());
+    RunCase(&vulkan, ImageCompareSwapPackedBits());
+    RunCase(&vulkan, ImageAtomicSwapReturnsPreviousTexel());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scaled-texture-only") == 0) {

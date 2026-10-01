@@ -53,7 +53,7 @@ void CommandBuffer::End() const {
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
                                  uint32_t arg2, uint32_t arg3, uint64_t arg4) {
-	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
 		const auto tick = m_context.GetCommandScheduler().CurrentTick();
 		std::fprintf(stderr,
 		             "HFW GPU command: tick=%" PRIu64 " op=%u submit=%" PRIu64

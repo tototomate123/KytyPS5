@@ -123,7 +123,7 @@ template <typename Image>
 SamplerClass ClassifySampler(const Image& image) {
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	    (image.conversion_format != Prospero::BufferFormat::kInvalid &&
-	     image.numeric_class == Prospero::TextureNumericClass::Uint) ||
+	     image.conversion_format != Prospero::BufferFormat::k16UScaled) ||
 	    (image.numeric_class == Prospero::TextureNumericClass::Uint &&
 	     image.dimension == Decoder::ImageDimension::Dim3D)) {
 		return SamplerClass::PointInteger;
@@ -773,8 +773,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic && format != Prospero::BufferFormat::k32UInt &&
-		    format != Prospero::BufferFormat::k32Float) {
+		if ((base.atomic || base.packed) && Prospero::NumBytesPerElement(format) != 4u) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
@@ -796,6 +795,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && !base.read && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		if (base.packed) {
+			image.numeric_class     = Prospero::TextureNumericClass::Uint;
+			image.conversion_format = Prospero::BufferFormat::kInvalid;
+		}
 		if (storage) {
 			if (format == Prospero::BufferFormat::k32FloatClamp ||
 			    format == Prospero::BufferFormat::k16UScaled ||

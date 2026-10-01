@@ -12,7 +12,12 @@
 
 namespace LoadDiagnostics {
 
-inline std::atomic<bool> hfw_gpu_trace_enabled {false};
+inline std::atomic<bool>     hfw_gpu_trace_enabled {false};
+inline std::atomic<uint64_t> hfw_compute_shader_count {0};
+inline bool                  HfwGpuTickTraceEnabled() {
+	return hfw_gpu_trace_enabled.load(std::memory_order_relaxed) &&
+	       hfw_compute_shader_count.load(std::memory_order_relaxed) >= 550u;
+}
 
 struct AprActivity {
 	std::chrono::steady_clock::time_point start          = std::chrono::steady_clock::now();

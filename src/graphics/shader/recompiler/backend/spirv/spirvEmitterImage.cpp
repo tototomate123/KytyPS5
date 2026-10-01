@@ -647,6 +647,7 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 
 spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
+		case IR::ValueOpcode::ImageAtomicCompareSwap32: return spv::OpAtomicCompareExchange;
 		case IR::ValueOpcode::ImageAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32: return spv::OpAtomicIAdd;
 		case IR::ValueOpcode::ImageAtomicUMin32: return spv::OpAtomicUMin;
@@ -836,8 +837,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				            return texel;
 			            });
 			        if (color == 0u) return ConstantU32CompositeZero(state, 4);
-			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
-			                            false, mem);
+			        return ResultVector(ctx,
+			                            image.packed ? color : UnpackImageTexel(ctx, mem, color),
+			                            numeric_class, false, mem);
 		        }));
 		return;
 	}
@@ -1072,7 +1074,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (image_info.access == IR::ImageAccess::Atomic) {
 		const auto dimension = image.dimension;
 		ctx.Define(
-		    inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+		    inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 			    const auto pointer = state.builder.AllocateId();
 			    const auto pointer_type =
 			        state.builder.Type(spv::OpTypePointer, spv::StorageClassImage, TypeU32(state));
@@ -1088,10 +1090,17 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				    });
 			    }
 			    const auto old = state.builder.AllocateId();
-			    state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
-			                              ConstantU32(state, spv::ScopeDevice),
-			                              ConstantU32(state, spv::MemorySemanticsMaskNone),
-			                              ctx.Arg(inst, 2));
+			    if (op == IR::ValueOpcode::ImageAtomicCompareSwap32) {
+				    state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
+				                              ConstantU32(state, spv::ScopeDevice),
+				                              ConstantU32(state, spv::MemorySemanticsMaskNone),
+				                              ConstantU32(state, spv::MemorySemanticsMaskNone),
+				                              ctx.Arg(inst, 2), ctx.Arg(inst, 3));
+			    } else
+				    state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
+				                              ConstantU32(state, spv::ScopeDevice),
+				                              ConstantU32(state, spv::MemorySemanticsMaskNone),
+				                              ctx.Arg(inst, 2));
 			    EmitDeviceAtomicMemoryBarrier(state);
 			    return old;
 		    }));

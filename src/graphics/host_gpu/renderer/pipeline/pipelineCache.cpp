@@ -446,6 +446,8 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, source]: programs) {
 			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
 		}
+		LoadDiagnostics::hfw_compute_shader_count.store(
+		    counts[static_cast<size_t>(ShaderType::Compute)], std::memory_order_relaxed);
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
 		            counts[static_cast<size_t>(ShaderType::Vertex)],

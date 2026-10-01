@@ -311,6 +311,7 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    format == Prospero::BufferFormat::k32Float && uint_resource && resource.atomic;
 	const bool format_ok =
 	    raw_sint_storage || raw_float_atomic ||
+	    (resource.atomic && uint_resource && Prospero::NumBytesPerElement(format) == 4u) ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -438,7 +439,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
-	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
+	    storage || resource.packed ||
+	            surface_format.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	const auto descriptor_type  = TextureType(descriptor);
@@ -604,7 +606,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
-	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
+	    storage || resource.packed ||
+	    resource.numeric_class == Prospero::SampledTextureNumericClass(format);
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
@@ -659,13 +662,27 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
 		                        physical_levels, tile, volume, size);
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+	if (size.size == 0 || size.align == 0 ||
+	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		EXIT("unsupported texture allocation layout: address=0x%016" PRIx64
+		     " size=%u align=%u remainder=%" PRIu64
+		     " extent=%ux%ux%u layers=%u levels=%u base=%u last=%u max=%u"
+		     " format=%u tile=%u storage=%d packed=%d atomic=%d dimension=%u"
+		     " pc=0x%08x source=%u indirect_root=%u"
+		     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     address, size.size, size.align, size.align != 0 ? address % size.align : uint64_t {0},
+		     width, height, depth, image_layers, physical_levels, base_level, last_level, max_mip,
+		     static_cast<uint32_t>(format), static_cast<uint32_t>(tile), storage, resource.packed,
+		     resource.atomic, static_cast<uint32_t>(resource.dimension), resource.first_use_pc,
+		     resource.source, resource.indirect_root, descriptor.fields[0], descriptor.fields[1],
+		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		     descriptor.fields[6], descriptor.fields[7]);
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	auto pixel_format = surface_format.vk_format;
+	auto pixel_format = resource.packed ? vk::Format::eR32Uint : surface_format.vk_format;
 	if (resource.depth_compare) {
 		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
 			pixel_format = depth_format->depth_attachment_format;

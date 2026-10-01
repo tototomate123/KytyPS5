@@ -395,6 +395,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                                      .count();
 		if (last_report.exchange(now, std::memory_order_relaxed) != now)
 			graphics.LogMemoryBudget(true);
+	}
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
 		std::fprintf(stderr,
 		             "HFW GPU submit: tick=%" PRIu64 " op=%u submit=%" PRIu64
 		             " args=%u,%u,%u,%u,0x%016" PRIx64 " gpu=%" PRIu64 " waits=%u(%" PRIu64

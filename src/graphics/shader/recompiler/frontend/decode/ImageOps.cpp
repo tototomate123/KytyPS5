@@ -160,16 +160,14 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
     {0xb5u, "image_sample_b_o_a",
      ImageSampleFlagBias | ImageSampleFlagOffset | ImageSampleFlagAdjust},
     {0xb6u, "image_sample_b_cl_o_a",
-     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
-         ImageSampleFlagAdjust},
+     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset | ImageSampleFlagAdjust},
     {0xb8u, "image_sample_c_o_a",
      ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust},
     {0xb9u, "image_sample_c_cl_o_a",
      ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
          ImageSampleFlagAdjust},
     {0xbdu, "image_sample_c_b_o_a",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset |
-         ImageSampleFlagAdjust},
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset | ImageSampleFlagAdjust},
     {0xbeu, "image_sample_c_b_cl_o_a",
      ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
          ImageSampleFlagOffset | ImageSampleFlagAdjust},
@@ -179,12 +177,9 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x44u, Opcode::IMAGE_GATHER4_L, ImageSampleFlagLod},
     {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
     {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
-    {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
-     ImageSampleFlagCompare | ImageSampleFlagLevelZero},
-    {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
-     ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x58u, Opcode::IMAGE_GATHER4_C_O,
-     ImageSampleFlagCompare | ImageSampleFlagOffset},
+    {0x4fu, Opcode::IMAGE_GATHER4_C_LZ, ImageSampleFlagCompare | ImageSampleFlagLevelZero},
+    {0x57u, Opcode::IMAGE_GATHER4_LZ_O, ImageSampleFlagLevelZero | ImageSampleFlagOffset},
+    {0x58u, Opcode::IMAGE_GATHER4_C_O, ImageSampleFlagCompare | ImageSampleFlagOffset},
     {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
     {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
@@ -194,15 +189,11 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
 };
 
 constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
-    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
-    {0x11u, Opcode::IMAGE_ATOMIC_ADD},
-    {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
-    {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
-    {0x18u, Opcode::IMAGE_ATOMIC_AND},
-    {0x19u, Opcode::IMAGE_ATOMIC_OR},
-    {0x1au, Opcode::IMAGE_ATOMIC_XOR},
-    {0x1eu, Opcode::IMAGE_ATOMIC_FMIN},
-    {0x1fu, Opcode::IMAGE_ATOMIC_FMAX},
+    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP}, {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
+    {0x11u, Opcode::IMAGE_ATOMIC_ADD},  {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
+    {0x17u, Opcode::IMAGE_ATOMIC_UMAX}, {0x18u, Opcode::IMAGE_ATOMIC_AND},
+    {0x19u, Opcode::IMAGE_ATOMIC_OR},   {0x1au, Opcode::IMAGE_ATOMIC_XOR},
+    {0x1eu, Opcode::IMAGE_ATOMIC_FMIN}, {0x1fu, Opcode::IMAGE_ATOMIC_FMAX},
 };
 
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);
@@ -223,6 +214,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 
 	switch (opcode) {
 		case 0x00u: return Opcode::IMAGE_LOAD;
+		case 0x02u: return Opcode::IMAGE_LOAD_PCK;
 		case 0x01u: return Opcode::IMAGE_LOAD_MIP;
 		case 0x08u: return Opcode::IMAGE_STORE;
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
@@ -260,6 +252,7 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
 		case 0x00u:
+		case 0x02u:
 		case 0x08u:
 		case 0x60u: return ImageCoordComponents(dimension);
 		default: return 0;
@@ -353,6 +346,10 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+	}
+	if (opcode == 0x02u && inst.dmask != 1u) {
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "packed image load requires a single 32-bit texel");
 	}
 	if (gather != nullptr && !std::has_single_bit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

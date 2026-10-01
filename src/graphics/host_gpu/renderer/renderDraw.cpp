@@ -1100,7 +1100,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
-	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
 		std::fprintf(stderr,
 		             "HFW GPU draw shaders: tick=%" PRIu64 " submit=%" PRIu64
 		             " count=%u vs=0x%016" PRIx64 " ps=0x%016" PRIx64 "\n",
@@ -1199,7 +1199,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
-	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
 		m_context.GetCommandScheduler().Flush();
 	}
 	auto& ucfg   = buffer.GetUserConfig();
@@ -1310,7 +1310,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
-	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
 		m_context.GetCommandScheduler().Flush();
 	}
 	auto& ucfg   = buffer.GetUserConfig();

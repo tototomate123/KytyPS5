@@ -46,9 +46,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
-	if (LoadDiagnostics::hfw_gpu_trace_enabled.load(std::memory_order_relaxed)) {
-		std::fprintf(stderr, "HFW GPU wait: target=%" PRIu64 " completed=%" PRIu64 "\n",
-		             tick, KnownGpuTick());
+	if (LoadDiagnostics::HfwGpuTickTraceEnabled()) {
+		std::fprintf(stderr, "HFW GPU wait: target=%" PRIu64 " completed=%" PRIu64 "\n", tick,
+		             KnownGpuTick());
 	}
 
 	vk::SemaphoreWaitInfo wait_info {};
